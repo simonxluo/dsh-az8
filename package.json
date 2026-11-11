@@ -1,6 +1,6 @@
 {
   "name": "dsh-az8",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "AZ8 Studio generation plugin for DeepSeek Harness: chat-driven image/video generation via the az8 CLI with quote gate, run journal, asset panel and skill packs. / 让 DSH Agent 通过 az8 CLI 在对话内生成图片/视频：报价闸门、运行日志、资产面板与技能包。",
   "type": "module",
