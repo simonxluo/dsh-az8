@@ -1,0 +1,8 @@
+# dsh-az8 — AZ8 Studio 生成插件（对话内出图/出视频 + 运行/资产/设置面板）
+#
+# 唯一云端通道是 az8 CLI（凭证由 CLI 自管）；数据落在
+# $DSH_HOME/integrations/dsh-az8/state.json（0600）。设计见 docs/design.md。
+- insert:
+    - id: az8
+      name: dsh-az8
+      config: {}
