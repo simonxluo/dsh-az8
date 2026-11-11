@@ -33,6 +33,7 @@ function augmentedEnv() {
 
 /** 把裸命令名解析成绝对路径（解析不了原样返回，交给 spawn 报错）。 */
 function resolveBin(bin) {
+	if (typeof bin !== 'string' || bin === '') return DEFAULT_BIN;
 	if (bin.includes('/')) return existsSync(bin) ? bin : bin;
 	for (const dir of ['.', ...EXTRA_PATH, ...augmentedEnv().PATH.split(':')]) {
 		const candidate = join(dir === '' ? '.' : dir, bin);
@@ -76,11 +77,15 @@ function tryParseJson(text) {
  * @returns {{exitCode:number, killed:boolean, classification:string, stdout:string, stderr:string, json?:any}}
  */
 export function run(args, options = {}) {
-	const bin = resolveBin(options.cliBin || DEFAULT_BIN);
+	// 防御：宿主配置层可能传进非字符串（曾把整个宿主炸掉）——类型不对就回退默认 bin。
+	const requested = options.cliBin;
+	const binName = typeof requested === 'string' && requested.trim() !== '' ? requested.trim() : DEFAULT_BIN;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	return new Promise((resolve) => {
 		let child;
+		let bin;
 		try {
+			bin = resolveBin(binName);
 			child = spawn(bin, args, {
 				cwd: options.cwd ?? process.cwd(),
 				env: augmentedEnv(),

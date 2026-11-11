@@ -162,13 +162,30 @@ function serveMedia(request, response, query) {
 	});
 }
 
+/**
+ * 路由处理器兜底：dsh-host-webserver 不捕获 handler 异常，任何 throw 都会变成
+ * 宿主进程的 fatal load failure——所以每个 handler 全包 try/catch，绝不允许漏网。
+ */
+function guarded(handler) {
+	return async (request, response) => {
+		try {
+			await handler(request, response);
+		} catch (error) {
+			try {
+				if (!response.headersSent) sendJson(response, 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
+				else response.end();
+			} catch { /* 响应已不可写 */ }
+		}
+	};
+}
+
 export function installPanelWeb(ctx, orch, creditsProvider) {
 	ctx.inject(['webServer'], (webCtx) => {
 		let creditsCache = { at: 0, value: null };
 		webCtx.effect(() => webCtx.webServer.register({
 			kind: 'exact',
 			path: CREDITS_ROUTE,
-			handler: async (request, response) => {
+			handler: guarded(async (request, response) => {
 				const verdict = loopVerdict(request);
 				if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
 				if (request.method !== 'GET') { response.writeHead(405, { allow: 'GET' }); response.end(); return; }
@@ -184,13 +201,13 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 					}
 				}
 				sendJson(response, 200, { ok: true, credits: creditsCache.value?.credits ?? [], whoami: creditsCache.value?.whoami ?? null });
-			},
+			}),
 		}));
 
 		webCtx.effect(() => webCtx.webServer.register({
 			kind: 'exact',
 			path: MEDIA_ROUTE,
-			handler: async (request, response) => {
+			handler: guarded(async (request, response) => {
 				const verdict = loopVerdict(request);
 				if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
 				if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -199,14 +216,19 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 					return;
 				}
 				const url = new URL(request.url ?? '/', 'http://localhost');
-				serveMedia(request, response, url.searchParams);
-			},
+				try {
+					serveMedia(request, response, url.searchParams);
+				} catch (error) {
+					if (!response.headersSent) sendJson(response, 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
+					else response.end();
+				}
+			}),
 		}));
 
 		webCtx.effect(() => webCtx.webServer.register({
 			kind: 'exact',
 			path: STATE_ROUTE,
-			handler: async (request, response) => {
+			handler: guarded(async (request, response) => {
 				try {
 					const verdict = loopVerdict(request);
 					if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
@@ -231,9 +253,10 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 					await store.mutate((state) => { Object.assign(state.settings, patch); });
 					sendJson(response, 200, { ok: true, value: patch });
 				} catch (error) {
-					sendJson(response, error?.name === 'StoreError' ? 400 : 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
+					if (!response.headersSent) sendJson(response, error?.name === 'StoreError' ? 400 : 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
+					else response.end();
 				}
-			},
+			}),
 		}));
 	});
 }

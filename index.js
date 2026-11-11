@@ -35,8 +35,11 @@ export function apply(ctx, rowConfig) {
 	setPaths(cfg);
 	let jobs;
 	try { jobs = ctx.get('jobs'); } catch { jobs = undefined; }
+	// 类型防御：配置层过来的值可能不是字符串（曾导致宿主 fatal）——统一回退。
+	const cliBinRaw = cfg.cliBin;
+	const cliBin = typeof cliBinRaw === 'string' && cliBinRaw.trim() !== '' ? cliBinRaw.trim() : 'az8';
 	const orch = createOrchestrator({
-		cliBin: cfg.cliBin || 'az8',
+		cliBin,
 		logger: ctx.logger,
 		jobs,
 	});
