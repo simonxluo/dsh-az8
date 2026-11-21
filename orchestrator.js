@@ -273,6 +273,41 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		return {};
 	}
 
+	/**
+	 * 画布中间产物预览：按 viewNodeId 下载到 cache 目录并返回相对 URL。
+	 * 供面板「工作流详情」展示非最终产物节点；失败返回 null（预览尽力而为）。
+	 */
+	const previewCache = new Map(); // viewNodeId -> { url, at }
+	async function previewCanvasNode(projectId, viewNodeId, { maxSize = 12 * 1024 * 1024, ttlMs = 10 * 60_000 } = {}) {
+		if (typeof viewNodeId !== 'string' || viewNodeId === '') return null;
+		const cached = previewCache.get(viewNodeId);
+		if (cached !== undefined && Date.now() - cached.at < ttlMs) return cached.url;
+		try {
+			const dir = store.getCacheDir();
+			await mkdir(dir, { recursive: true });
+			const file = join(dir, `${viewNodeId.replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`);
+			if (!existsSync(file)) {
+				const result = await call(['canvas', 'download', projectId, '--view-node-id', viewNodeId, '--output', file], 120_000);
+				if (result.exitCode !== 0) return null;
+				const info = result.json?.file ?? {};
+				if (Number(info.bytes ?? 0) > maxSize) return null;
+				const mime = String(info.contentType ?? '');
+				const ext = String(info.detectedExtension ?? '').replace(/^\./, '') || (mime.split('/')[1] ?? 'bin').split(';')[0];
+				const named = join(dir, `${viewNodeId.replace(/[^a-zA-Z0-9_-]/g, '_')}.${ext}`);
+				await rename(file, named);
+				previewCache.set(viewNodeId, { url: `/_dsh/dsh-az8/cache?node=${encodeURIComponent(viewNodeId)}&ext=${encodeURIComponent(ext)}`, at: Date.now() });
+				return previewCache.get(viewNodeId).url;
+			}
+			// 文件已在：从磁盘扩展名恢复 URL。
+			const ext = extname(file).slice(1) || 'bin';
+			previewCache.set(viewNodeId, { url: `/_dsh/dsh-az8/cache?node=${encodeURIComponent(viewNodeId)}&ext=${encodeURIComponent(ext)}`, at: Date.now() });
+			return previewCache.get(viewNodeId).url;
+		} catch (error) {
+			log(`previewCanvasNode ${viewNodeId} failed: ${firstLine(error?.message)}`);
+			return null;
+		}
+	}
+
 	function extractUsageCredits(runJson) {
 		for (const hit of deepScan(runJson, (v) => v?.usage?.credits !== undefined)) {
 			const credits = hit.usage.credits;
@@ -541,7 +576,21 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 				}
 				const estimate = Number(inner.estimate?.credits?.total ?? NaN);
 				const affordable = inner.estimate?.credits?.canAfford ?? true;
-				await store.mutate((s) => store.patchRun(s, runId, { creditsEstimated: Number.isFinite(estimate) ? estimate : undefined }));
+				// 工作流详情落盘：定义元数据 + 生效 config（面板「运行详情」可查）。
+				const detailMeta = {
+					definition: inner.definition ?? null,
+					config: (Array.isArray(inner.configFields)
+						? inner.configFields.filter((f) => typeof f?.name === 'string' && f.value !== undefined).reduce((acc, f) => { acc[f.name] = f.value; return acc; }, {})
+						: {}),
+					configFields: Array.isArray(inner.configFields)
+						? inner.configFields.map((f) => ({ name: f.name, value: f.value, options: f.options ?? null, required: f.required === true }))
+						: [],
+				};
+				await store.mutate((s) => store.patchRun(s, runId, {
+					creditsEstimated: Number.isFinite(estimate) ? estimate : undefined,
+					definitionName: String(inner.definition?.name ?? '') || undefined,
+					detail: detailMeta,
+				}));
 				const planOps = Array.isArray(inner.operations) ? inner.operations : [];
 				if (planOps.length === 0) {
 					// 真机形态：默认 Draft 不可用时 plan 返回 alternatives（候选定义）而不是 operations。
@@ -609,8 +658,61 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		};
 	}
 
+	/**
+	 * 单个 run 的完整详情（面板「运行详情」数据源）：
+	 * journal 快照 + 权威 workflowRun 事实 + 输入/输出节点 + 中间产物预览 URL。
+	 * workflowRunId 缺失（未开始/未到 start）时返回 journal 侧已知部分。
+	 */
+	async function runDetail(runId) {
+		return queued(async () => {
+			const run = snapshot(runId);
+			if (run === undefined) throw new store.StoreError(`run ${runId} 不存在`);
+			const out = { run, facts: null, inputs: [], outputs: [], intermediates: [] };
+			if (run.workflowRunId === '' || run.projectId === '') return out;
+			await ensureSession(run.projectId);
+			let facts = {};
+			try { facts = await getRunFacts(run.workflowRunId); } catch (error) {
+				out.factsError = firstLine(error?.message);
+				return out;
+			}
+			out.facts = facts;
+			// 输入节点（prompt / config 的 viewNode 绑定，可能缺失）与输出节点（slotName 带 role）。
+			for (const hit of deepScan(facts, (v) => Array.isArray(v.inputs))) {
+				for (const item of hit.inputs) out.inputs.push(item);
+			}
+			out.inputs = out.inputs.slice(0, 12);
+			for (const hit of deepScan(facts, (v) => Array.isArray(v.outputs))) {
+				for (const item of hit.outputs) {
+					out.outputs.push({
+						coreNodeId: String(item?.coreNodeId ?? ''),
+						slotName: String(item?.slotName ?? ''),
+						role: String(item?.role ?? ''),
+					});
+				}
+			}
+			out.outputs = out.outputs.slice(0, 12);
+			// 中间产物预览：生成目标附近画布上的媒体节点，排除最终产物（已在 assets）。
+			try {
+				const detail = await callOk(['session', 'query', 'canvas.detail', '--view-node-id', run.viewNodeId], 'canvas.detail', 30_000);
+				const state = store.loadState();
+				const finalIds = new Set((run.assets ?? []).map((id) => store.getAsset(state, id)?.coreNodeId).filter(Boolean));
+				const seen = new Set();
+				for (const node of deepScan(detail, (v) => typeof v === 'object' && (v.contentType === 'image' || v.contentType === 'video' || v.contentType === 'audio') && typeof v.id === 'string')) {
+					if (finalIds.has(node.id) || seen.has(node.id)) continue;
+					seen.add(node.id);
+					if (out.intermediates.length >= 6) break;
+					const url = await previewCanvasNode(run.projectId, node.id);
+					if (url !== null) out.intermediates.push({ viewNodeId: node.id, contentType: node.contentType, url });
+				}
+			} catch (error) {
+				log(`runDetail canvas scan failed: ${firstLine(error?.message)}`);
+			}
+			return out;
+		});
+	}
+
 	return {
-		generate, resume: generate, waitRun, status, definitions,
+		generate, resume: generate, waitRun, status, definitions, runDetail,
 		uploadMedia, downloadOne, ensureSession, closeSession,
 		markSkillRead: (slug) => { readSkills.add(String(slug)); },
 		listSkills,

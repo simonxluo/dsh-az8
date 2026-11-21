@@ -47,6 +47,8 @@ export function setPaths(config = {}) {
 export function getStateFile() { return stateFile || (setPaths({}), stateFile); }
 export function getAssetsDir() { return assetsDir || (setPaths({}), assetsDir); }
 export function getSkillsDir() { return skillsDir || (setPaths({}), skillsDir); }
+/** 画布产物预览缓存目录（中间产物按 coreNodeId 落一份，不进 assets 索引）。 */
+export function getCacheDir() { return join(getAssetsDir(), '.cache'); }
 
 // --- 默认状态 ----------------------------------------------------------------
 

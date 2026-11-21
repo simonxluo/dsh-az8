@@ -214,6 +214,20 @@ const CSS = `
 .az8-save:active{transform:scale(.98);filter:brightness(.95);}
 .az8-flash{font-size:12px;color:var(--green);text-align:center;min-height:16px;margin-top:8px;}
 
+/* —— 运行详情 —— */
+.az8-run{cursor:pointer;}
+.az8-run:hover{border-color:var(--hairline);}
+.az8-run:active{transform:scale(.995);}
+.az8-back{border:none;background:none;cursor:pointer;color:var(--blue);font-size:13px;font-weight:600;
+ padding:2px 0 10px;display:block;}
+.az8-kv{display:flex;align-items:baseline;gap:10px;padding:7px 12px;min-width:0;}
+.az8-kv + .az8-kv{border-top:1px solid var(--hairline2);}
+.az8-kv .k{font-size:12px;color:var(--text2);flex:none;width:76px;}
+.az8-kv .v{font-size:12.5px;color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums;}
+.az8-prompt{padding:10px 12px;font-size:12.5px;color:var(--text);line-height:1.5;white-space:pre-wrap;word-break:break-word;}
+.az8-json{margin:0;padding:10px 12px;font-size:10.5px;line-height:1.5;color:var(--text2);
+ background:var(--fill);border-radius:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;}
+
 /* —— 灯箱 —— */
 .az8-lightbox{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;cursor:zoom-out;
  background:rgba(0,0,0,.78);backdrop-filter:blur(20px) saturate(120%);-webkit-backdrop-filter:blur(20px) saturate(120%);
@@ -275,7 +289,7 @@ function Glyph({ kind }) {
 		h("path", { d: "M3.4 11.2l3.1-3a1.4 1.4 0 0 1 1.9-.05L14 13", stroke: "currentColor", strokeWidth: 1.4, strokeLinejoin: "round" }));
 }
 
-function RunCard({ run }) {
+function RunCard({ run, onOpenDetail }) {
 	const meta = STATUS_META[run.status] ?? { zh: run.status, en: run.status, light: "#8E8E93", dark: "#98989D" };
 	const label = UI_LANG === "zh" ? meta.zh : meta.en;
 	const color = `var(--${meta.key === "succeeded" ? "green" : meta.key === "failed" ? "red" : meta.key === "warn" ? "orange" : meta.key === "running" ? "blue" : "gray"})`;
@@ -283,7 +297,7 @@ function RunCard({ run }) {
 	if (run.creditsEstimated != null) credits.push(`≈ ${run.creditsEstimated}`);
 	if (run.creditsActual != null) credits.push(`实耗 ${run.creditsActual}`);
 	const name = run.definitionName || run.projectName || run.projectId || "生成";
-	return h("div", { className: "az8-card" },
+	return h("div", { className: "az8-card az8-run", onClick: () => onOpenDetail(run.id) },
 		h("div", { className: "az8-run-top" },
 			h("span", { className: "az8-dot", style: { background: color, boxShadow: `0 0 0 3px color-mix(in srgb, ${color} 18%, transparent)` } }),
 			h("span", { className: "az8-run-name" }, `${name} · ${label}`),
@@ -300,14 +314,82 @@ function RunCard({ run }) {
 	);
 }
 
-function RunsTab({ runs }) {
+/** 运行详情：工作流元数据 + 生效 config + 输入/输出节点 + 中间产物预览。 */
+function RunDetail({ runId, onClose, onOpenImage }) {
+	const [data, setData] = useState(null);
+	const [err, setErr] = useState("");
+	useEffect(() => {
+		let alive = true;
+		setData(null); setErr("");
+		fetchJson(`_dsh/dsh-az8/detail?run=${encodeURIComponent(runId)}`)
+			.then((json) => { if (alive) setData(json); })
+			.catch((e) => { if (alive) setErr(String(e.message ?? e)); });
+		return () => { alive = false; };
+	}, [runId]);
+	const back = h("button", { className: "az8-back", onClick: onClose, "aria-label": "az8-detail-back" }, "‹ " + (UI_LANG === "zh" ? "返回" : "Back"));
+	if (err !== "") return h("div", null, back, h("div", { style: { padding: 24, color: "var(--orange)", fontSize: 12 } }, err));
+	if (data === null) return h("div", null, back, h("div", { className: "az8-runs" }, h("div", { className: "az8-sk", style: { height: 120 } })));
+	const run = data.run ?? {};
+	const detail = run.detail ?? {};
+	const def = detail.definition ?? {};
+	const config = detail.config ?? {};
+	const facts = data.facts ?? null;
+	const KV = (k, v) => h("div", { className: "az8-kv" }, h("span", { className: "k" }, k), h("span", { className: "v" }, v));
+	return h("div", { className: "az8-detail" },
+		back,
+		h("div", { className: "az8-group" },
+			h("div", { className: "az8-group-h" }, UI_LANG === "zh" ? "工作流" : "Workflow"),
+			h("div", { className: "az8-rows" },
+				KV(UI_LANG === "zh" ? "模型" : "Model", def.name || run.definitionName || run.definitionId || "—"),
+				def.capability ? KV(UI_LANG === "zh" ? "能力" : "Capability", def.capability) : null,
+				def.lane ? KV("Lane", def.lane) : null,
+				run.creditsEstimated != null ? KV(UI_LANG === "zh" ? "报价" : "Estimate", `${run.creditsEstimated} cr`) : null,
+				run.creditsActual != null ? KV(UI_LANG === "zh" ? "实耗" : "Actual", `${run.creditsActual} cr`) : null,
+				run.workflowRunId ? KV("Run", run.workflowRunId.slice(0, 12) + "…") : null,
+			),
+		),
+		h("div", { className: "az8-group" },
+			h("div", { className: "az8-group-h" }, UI_LANG === "zh" ? "提示词" : "Prompt"),
+			h("div", { className: "az8-rows" }, h("div", { className: "az8-prompt" }, run.prompt || "—")),
+		),
+		Object.keys(config).length > 0 ? h("div", { className: "az8-group" },
+			h("div", { className: "az8-group-h" }, UI_LANG === "zh" ? "参数" : "Config"),
+			h("div", { className: "az8-rows" }, Object.entries(config).map(([k, v]) => KV(k, String(v)))),
+		) : null,
+		Array.isArray(data.outputs) && data.outputs.length > 0 ? h("div", { className: "az8-group" },
+			h("div", { className: "az8-group-h" }, UI_LANG === "zh" ? "输出节点" : "Outputs"),
+			h("div", { className: "az8-rows" }, data.outputs.map((o, i) => KV(o.slotName || `out ${i + 1}`, o.coreNodeId.slice(0, 12) + "…"))),
+		) : null,
+		Array.isArray(data.intermediates) && data.intermediates.length > 0 ? h("div", { className: "az8-group" },
+			h("div", { className: "az8-group-h" }, UI_LANG === "zh" ? "中间产物" : "Intermediates"),
+			h("div", { className: "az8-grid" }, data.intermediates.map((it) => h("div", {
+				key: it.viewNodeId,
+				className: "az8-asset" + (it.contentType === "image" ? " img" : ""),
+				onClick: it.contentType === "image" ? () => onOpenImage(it.url) : undefined,
+			},
+				it.contentType === "image" ? h("img", { className: "media", src: it.url, loading: "lazy" })
+				: it.contentType === "video" ? h("video", { className: "media video", src: it.url, controls: true, preload: "metadata" })
+				: h("div", { className: "media", style: { display: "grid", placeItems: "center", color: "var(--text2)" } }, h(Glyph, { kind: "audio" })),
+			))),
+		) : null,
+		facts !== null ? h("div", { className: "az8-raw" },
+			h("div", { className: "az8-group-h", style: { cursor: "pointer" }, onClick: (e) => {
+				const el = e.currentTarget.nextElementSibling;
+				el.style.display = el.style.display === "none" ? "block" : "none";
+			} }, UI_LANG === "zh" ? "▸ 原始 Run 事实" : "▸ Raw run facts"),
+			h("pre", { className: "az8-json", style: { display: "none" } }, JSON.stringify(facts, null, 1).slice(0, 4000)),
+		) : null,
+	);
+}
+
+function RunsTab({ runs, onOpenDetail }) {
 	if (runs === null) return h("div", { className: "az8-runs" },
 		h("div", { className: "az8-sk" }), h("div", { className: "az8-sk" }), h("div", { className: "az8-sk" }));
 	if (!runs || runs.length === 0) return h("div", { className: "az8-empty" },
 		h("div", { className: "halo" }, "✨"),
 		h("div", { className: "t1" }, t("empty.runs")),
 		h("div", { className: "t2" }, t("empty.runs.hint")));
-	return h("div", { className: "az8-runs" }, runs.map((run) => h(RunCard, { key: run.id, run })));
+	return h("div", { className: "az8-runs" }, runs.map((run) => h(RunCard, { key: run.id, run, onOpenDetail })));
 }
 
 function AssetCard({ asset, onOpen }) {
@@ -423,6 +505,7 @@ function Az8Panel(props, ctx) {
 	const [error, setError] = useState("");
 	const [spinning, setSpinning] = useState(false);
 	const [lightbox, setLightbox] = useState(null);
+	const [detailRunId, setDetailRunId] = useState(null);
 	const [, bump] = useState(0);
 	const theme = useTheme();
 	const styleTag = useMemo(() => h("style", { dangerouslySetInnerHTML: { __html: CSS } }), []);
@@ -475,7 +558,9 @@ function Az8Panel(props, ctx) {
 		),
 		error ? h("div", { style: { padding: "2px 16px 8px", fontSize: 12, color: "var(--orange)" } }, t("error.load") + error) : null,
 		h("div", { className: "az8-body" },
-			tab === "runs" ? h(RunsTab, { runs: snapshot?.runs ?? null })
+			tab === "runs" ? (detailRunId !== null
+				? h(RunDetail, { runId: detailRunId, onClose: () => setDetailRunId(null), onOpenImage: (url) => setLightbox({ url }) })
+				: h(RunsTab, { runs: snapshot?.runs ?? null, onOpenDetail: setDetailRunId }))
 			: tab === "assets" ? h(AssetsTab, { assets: snapshot?.assets ?? null, onOpen: setLightbox })
 			: h(SettingsTab, { snapshot, reload }),
 		),

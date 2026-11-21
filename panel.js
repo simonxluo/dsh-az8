@@ -18,6 +18,8 @@ import * as store from './store.js';
 export const STATE_ROUTE = '/_dsh/dsh-az8/state';
 export const CREDITS_ROUTE = '/_dsh/dsh-az8/credits';
 export const MEDIA_ROUTE = '/_dsh/dsh-az8/media';
+export const DETAIL_ROUTE = '/_dsh/dsh-az8/detail';
+export const CACHE_ROUTE = '/_dsh/dsh-az8/cache';
 export const MEDIA_URL = (assetId) => `${MEDIA_ROUTE}?id=${encodeURIComponent(assetId)}`;
 
 /** 工具结果里的可贴 markdown：图片内嵌、其余给链接（dsh-comfyui 验证过的展示模式）。 */
@@ -221,6 +223,62 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 				} catch (error) {
 					if (!response.headersSent) sendJson(response, 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
 					else response.end();
+				}
+			}),
+		}));
+
+		webCtx.effect(() => webCtx.webServer.register({
+			kind: 'exact',
+			path: DETAIL_ROUTE,
+			handler: guarded(async (request, response) => {
+				const verdict = loopVerdict(request);
+				if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
+				if (request.method !== 'GET') { response.writeHead(405, { allow: 'GET' }); response.end(); return; }
+				const url = new URL(request.url ?? '/', 'http://localhost');
+				const runId = String(url.searchParams.get('run') ?? '');
+				if (runId === '') { sendJson(response, 400, { ok: false, error: 'missing ?run=<runId>' }); return; }
+				const detail = await orch.runDetail(runId);
+				sendJson(response, 200, { ok: true, ...detail });
+			}),
+		}));
+
+		webCtx.effect(() => webCtx.webServer.register({
+			kind: 'exact',
+			path: CACHE_ROUTE,
+			handler: guarded(async (request, response) => {
+				const verdict = loopVerdict(request);
+				if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
+				if (request.method !== 'GET' && request.method !== 'HEAD') {
+					response.writeHead(405, { allow: 'GET, HEAD' });
+					response.end();
+					return;
+				}
+				const url = new URL(request.url ?? '/', 'http://localhost');
+				const node = String(url.searchParams.get('node') ?? '').replace(/[^a-zA-Z0-9_-]/g, '_');
+				const ext = String(url.searchParams.get('ext') ?? 'bin').replace(/[^a-zA-Z0-9]/g, '');
+				if (node === '') { sendJson(response, 400, { ok: false, error: 'missing ?node=' }); return; }
+				// 中间产物缓存按 node 名寻址，仅 cache 目录内，无穿越面。
+				const file = join(store.getCacheDir(), `${node}.${ext}`);
+				try {
+					const info = await stat(file);
+					const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+						: ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : ext === 'mp4' ? 'video/mp4'
+						: ext === 'webm' ? 'video/webm' : ext === 'mp3' ? 'audio/mpeg' : ext === 'wav' ? 'audio/wav'
+						: 'application/octet-stream';
+					const base = { 'content-type': mime, 'accept-ranges': 'bytes', 'cache-control': 'private, max-age=600' };
+					const range = parseRange(request.headers.range, info.size);
+					if (range === null) { response.writeHead(416, { 'content-range': `bytes */${info.size}` }); response.end(); return; }
+					if (range === undefined) {
+						response.writeHead(200, { ...base, 'content-length': info.size });
+						if (request.method === 'HEAD') { response.end(); return; }
+						createReadStream(file).pipe(response);
+						return;
+					}
+					response.writeHead(206, { ...base, 'content-length': range.end - range.start + 1, 'content-range': `bytes ${range.start}-${range.end}/${info.size}` });
+					if (request.method === 'HEAD') { response.end(); return; }
+					createReadStream(file, { start: range.start, end: range.end }).pipe(response);
+				} catch {
+					sendJson(response, 404, { ok: false, error: `no cached preview for node ${node}` });
 				}
 			}),
 		}));
