@@ -118,12 +118,13 @@ dsh plugin --profile desktop add github:simonxluo/dsh-az8
 
 ```bash
 npm install
-npm test   # store + orchestrator 状态机（fake CLI，不碰真 az8）
+npm test   # store + orchestrator 状态机 + panel 路由（fake CLI / 真 HTTP，不碰真 az8）
 ```
 
 测试覆盖：水位线 id、journal 裁剪、settings 校验、报价闸门 → resume、脏 config
 自动清洗、exit 2 不确定停链、plan 阻塞、running → 再等一窗口、运行详情（中间产物按
-血缘、老 run 回填、回填后零 CLI、步骤着色、余额不足提示）等 12 组。真机校准记录
+血缘、老 run 回填、回填后零 CLI、步骤着色、余额不足提示）等 12 组，以及面板路由 6 组
+（状态码分级、Range/206、预览缓存 key 清洗、Host / 跨站校验）。真机校准记录
 （AZ8 Receipt 真实形态）在 [docs/design.md §13](docs/design.md)。
 
 ## License

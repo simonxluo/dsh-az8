@@ -49,7 +49,7 @@
     }
   },
   "scripts": {
-    "test": "node test/store.test.mjs && node test/orchestrator.test.mjs"
+    "test": "node test/store.test.mjs && node test/orchestrator.test.mjs && node test/panel.test.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"

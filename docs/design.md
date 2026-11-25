@@ -331,6 +331,8 @@ login态(已配) ─ session ─ definitions ─ target ─ plan ─ ─gate─ 
 ## 11. 测试计划
 
 1. `test/store.test.mjs`：水位线、裁剪、原子写、settings 校验。
+   `test/panel.test.mjs`（v0.2.3）：真 HTTP server 跑真 panel.js——detail 404/400/500 分级、
+   state / credits 缓存 / media 200·206·416·404 / cache key 清洗 / Host 与跨站校验，且无异常漏到宿主。
 2. `test/orchestrator.test.mjs`：注入 fake cli（脚本桩），覆盖状态机全转移 + 闸门 + exit2 停链。
 3. 真机冒烟（手动，一次）：definitions → generate(image, 最便宜) → 面板资产页出现 → 对话内出图。
 4. `test/orchestrator.test.mjs` 详情用例（v0.2.3，第 8–12 组）：中间产物按血缘且排除最终产物、

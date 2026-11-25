@@ -169,6 +169,7 @@ function serveMedia(request, response, query) {
 /**
  * 路由处理器兜底：dsh-host-webserver 不捕获 handler 异常，任何 throw 都会变成
  * 宿主进程的 fatal load failure——所以每个 handler 全包 try/catch，绝不允许漏网。
+ * store.StoreError 是"请求本身不成立"（run 不存在等），回 4xx 而不是 500。
  */
 function guarded(handler) {
 	return async (request, response) => {
@@ -176,8 +177,10 @@ function guarded(handler) {
 			await handler(request, response);
 		} catch (error) {
 			try {
-				if (!response.headersSent) sendJson(response, 500, { ok: false, error: String(error?.message ?? error).split('\n', 1)[0] });
-				else response.end();
+				if (response.headersSent) { response.end(); return; }
+				const message = String(error?.message ?? error).split('\n', 1)[0];
+				const status = error instanceof store.StoreError ? (/不存在|需要|没有/.test(message) ? 404 : 400) : 500;
+				sendJson(response, status, { ok: false, error: message });
 			} catch { /* 响应已不可写 */ }
 		}
 	};
