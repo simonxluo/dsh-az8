@@ -400,7 +400,15 @@ cli → store → skills → orchestrator → panel → tools → index → clie
     "超闸门"与"余额不足"（canAfford=false 时让用户确认没有意义）。
 11. **回放自检挡掉的一个真 bug**：详情里的产物条目键是 `id`，路由补 URL 时却只认 `assetId`，
     缩略图全空。修法：路由对 assets 按 `id`、对 inputs 按 `assetId` 补 URL，client 再兜底一层。
-12. **r1–r3 的失败形态**（11-09 冒烟）：三条都停在 plan（`plan-empty`），目标节点是
+12. **面板配色改接宿主主题 token**（DSH 规则：容器与控件继承宿主主题，字面色只许用在图标/作品上）。
+    `Theme.listTokens` 给出 13 个 `--dsw-alias-*`（背景三层、边框两层、品牌色、两级文字色、四个状态色）。
+    面板内部变量名（`--text/--surface/--fill…`）不变、约 90 条引用规则不动，只在定义处改写为
+    `var(--dsw-alias-…, 私有兜底)`：token 改名只掉外观、不破渲染。
+    明暗判定不再猜 body 底色：优先读面板根节点处的 `--dsw-alias-bg-base` 实际值，读不到才退回 body。
+    `data-theme` 只保留 token 表达不了的差异（弱化文字档位、阴影强度）；灯箱遮罩刻意压暗，不跟主题。
+    `theme` 服务只有 `getTheme()` 没有 subscribe，ThemeSnapshot 形态拿不到（inspect 不接受 input），
+    所以不依赖它的结构。
+13. **r1–r3 的失败形态**（11-09 冒烟）：三条都停在 plan（`plan-empty`），目标节点是
     `data.creationIntent:"blank"` 的空白生成目标，`history` 为空、没有 `resolvedCoreNodeId`。
     回填对它们无事可做（只补 targetAt），步骤显示「规划报价」红色 + 其后空心。这三个空白
     节点还留在 Blank Reel 画布上（y=2600 一排），是用户画布上的调试残留，清理由用户决定。

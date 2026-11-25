@@ -174,22 +174,34 @@ const STATUS_META = {
 // ---------------------------------------------------------------------------
 
 const CSS = `
-.az8{--blue:#0A84FF;--green:#30D158;--red:#FF453A;--orange:#FF9F0A;--gray:#98989D;
- --text:#f5f5f7;--text2:rgba(235,235,245,.62);--text3:rgba(235,235,245,.36);
- --hairline:rgba(255,255,255,.10);--hairline2:rgba(255,255,255,.06);
- --surface:rgba(38,38,40,.66);--surface2:rgba(56,56,58,.55);--surface3:rgba(118,118,128,.20);
- --fill:rgba(120,120,128,.18);--shadow:0 1px 2px rgba(0,0,0,.28),0 10px 32px rgba(0,0,0,.22);
+.az8{
+ /* 容器与控件继承宿主主题（DSH 规则：--dsw-alias-* token 优先，字面色只许用在图标/作品上）。
+    每个变量都带私有兜底：宿主 token 改名只掉外观，不破渲染。 */
+ --blue:var(--dsw-alias-brand-primary,#0A84FF);
+ --green:var(--dsw-alias-state-success-primary,#30D158);
+ --red:var(--dsw-alias-state-error-primary,#FF453A);
+ --orange:var(--dsw-alias-state-warn-primary,#FF9F0A);
+ --gray:var(--dsw-alias-state-idle-primary,#98989D);
+ --text:var(--dsw-alias-label-primary,#f5f5f7);
+ --text2:var(--dsw-alias-label-secondary,rgba(235,235,245,.62));
+ --bg:var(--dsw-alias-bg-base,#1e1e20);
+ --hairline:var(--dsw-alias-border-l2,rgba(255,255,255,.10));
+ --hairline2:var(--dsw-alias-border-l1,rgba(255,255,255,.06));
+ --surface:var(--dsw-alias-bg-layer-1,#282828);
+ --surface2:var(--dsw-alias-bg-layer-2,#38383a);
+ --surface3:var(--dsw-alias-bg-overlay,#4a4a4c);
+ --fill:var(--dsw-alias-bg-layer-2,#2c2c2e);
+ --shadow:0 1px 2px rgba(0,0,0,.28),0 10px 32px rgba(0,0,0,.22);
  --shadow-sm:0 1px 2px rgba(0,0,0,.22);
+ --on-surface:var(--text);
  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;
  font-size:13px;line-height:1.45;color:var(--text);
  -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;height:100%;min-height:0;}
-.az8[data-theme="light"]{--green:#34C759;--red:#FF3B30;--orange:#FF9500;--blue:#007AFF;--gray:#8E8E93;
- --text:#1d1d1f;--text2:rgba(60,60,67,.62);--text3:rgba(60,60,67,.34);
- --hairline:rgba(0,0,0,.10);--hairline2:rgba(0,0,0,.05);
- --surface:rgba(255,255,255,.72);--surface2:rgba(255,255,255,.55);--surface3:rgba(118,118,128,.12);
- --fill:rgba(118,118,128,.12);
+/* data-theme 只保留 token 表达不了的明暗差：弱化文字的档位、阴影强度 */
+.az8[data-theme="light"]{--text3:color-mix(in srgb,var(--dsw-alias-label-secondary,#3a3a3c) 55%,transparent);
  --shadow:0 1px 2px rgba(0,0,0,.05),0 10px 32px rgba(0,0,0,.08);
  --shadow-sm:0 1px 2px rgba(0,0,0,.06);}
+.az8:not([data-theme="light"]){--text3:color-mix(in srgb,var(--dsw-alias-label-secondary,#ebebf5) 58%,transparent);}
 .az8 *{box-sizing:border-box;}
 .az8 button{font-family:inherit;}
 
@@ -214,8 +226,7 @@ const CSS = `
 .az8-seg{display:flex;margin:2px 16px 12px;padding:2px;border-radius:10px;background:var(--fill);}
 .az8-seg button{flex:1;border:none;background:none;cursor:pointer;color:var(--text2);
  font-size:12.5px;font-weight:560;padding:5px 0;border-radius:8px;transition:all .18s ease;letter-spacing:-.01em;}
-.az8-seg button.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm);}
-.az8[data-theme="light"] .az8-seg button.on{background:rgba(255,255,255,.95);}
+.az8-seg button.on{background:var(--dsw-alias-bg-overlay,var(--surface));color:var(--text);box-shadow:var(--shadow-sm);}
 
 /* —— 滚动区 —— */
 .az8-body{flex:1;min-height:0;overflow-y:auto;padding:0 16px 18px;scrollbar-width:thin;}
@@ -333,6 +344,7 @@ const CSS = `
 .az8-credits.low .dot{background:var(--orange);box-shadow:0 0 6px var(--orange);}
 
 /* —— 灯箱 —— */
+/* 灯箱遮罩故意压暗（图片查看器惯例：浅色主题下也要有对比），这是刻意不跟主题的一处 */
 .az8-lightbox{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;cursor:zoom-out;
  background:rgba(0,0,0,.78);backdrop-filter:blur(20px) saturate(120%);-webkit-backdrop-filter:blur(20px) saturate(120%);
  animation:az8fade .2s ease;}
@@ -342,13 +354,16 @@ const CSS = `
 @keyframes az8zoom{from{transform:scale(.95);opacity:.4}}
 `;
 
-function useTheme() {
+function useTheme(ref) {
 	const [theme, setTheme] = useState("dark");
 	useEffect(() => {
 		let alive = true;
 		const detect = () => {
 			try {
-				const bg = getComputedStyle(document.body).backgroundColor;
+				// 优先读宿主背景 token 在本面板处的实际值（跟随真实主题）；token 不存在时退回 body 底色
+				const probe = ref !== undefined && ref.current !== null ? getComputedStyle(ref.current) : null;
+				const token = probe !== null ? probe.getPropertyValue("--dsw-alias-bg-base").trim() : "";
+				const bg = token !== "" && CSS.supports("color", token) ? token : getComputedStyle(document.body).backgroundColor;
 				const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(bg || "");
 				if (m !== null) {
 					const lum = (0.299 * Number(m[1]) + 0.587 * Number(m[2]) + 0.114 * Number(m[3])) / 255;
@@ -659,7 +674,8 @@ function Az8Panel(props, ctx) {
 	const [lightbox, setLightbox] = useState(null);
 	const [detailRunId, setDetailRunId] = useState(null);
 	const [, bump] = useState(0);
-	const theme = useTheme();
+	const rootRef = useRef(null);
+	const theme = useTheme(rootRef);
 	const styleTag = useMemo(() => h("style", { dangerouslySetInnerHTML: { __html: CSS } }), []);
 	useEffect(() => { listeners.push(bump); return () => { listeners = listeners.filter((fn) => fn !== bump); }; }, []);
 	useEffect(() => {
@@ -693,7 +709,7 @@ function Az8Panel(props, ctx) {
 
 	const balance = (credits?.credits ?? [])[0];
 	const tabs = [["runs", "az8-tab-runs", t("tab.runs")], ["assets", "az8-tab-assets", t("tab.assets")], ["settings", "az8-tab-settings", t("tab.settings")]];
-	return h("div", { className: "az8", "data-theme": theme },
+	return h("div", { className: "az8", "data-theme": theme, ref: rootRef },
 		styleTag,
 		h("div", { className: "az8-head" },
 			h("div", { className: "az8-mark" }, "A8"),
