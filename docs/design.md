@@ -217,6 +217,35 @@ args.references[] 三种来源统一折算成 viewNodeId：
 → 交给 planGeneration 的 references（slotName 可选，意图明确时才给）
 ```
 
+### 4.5 左栏入口流（主面板页，v0.2.4）
+
+宿主事实（已读安装包源码：`dsh-client-ui-sidebar/src/client/contract/slots.ts`、`dsh-client-ui-layout/src/client/{index,service}.ts`）：
+一个「全局面板」= 两条注册、同一个 id：
+
+```
+① sidebar.panellist（list, root）  { id:"dsh-az8", order:20, label } + 图标组件(props:{size,active})
+      → 左栏一行（展开 32px / 收起 36px），标签即可见文字 + 无障碍名 + 收起态 tooltip
+② main（keyed, root）              { name:"main", key:"dsh-az8" } + 页面组件
+      → 中栏整页；`ctx.layout.selectPanel("dsh-az8")` 选中，`selectPanel(null)` 回到对话
+```
+
+```
+左栏点击 ──▶ layout store selectPanel("dsh-az8") ──▶ 中栏渲染 Az8Panel(variant:"page")
+                                                   └─ 右栏（会话作用域）此时 mounted=undefined
+Az8Panel 两个实例（右栏页签 / 主面板页）各自持状态、各自轮询同一组路由：
+  state 是磁盘只读快照（便宜）；credits 路由服务端 5 分钟缓存 → 不会多 spawn az8
+```
+
+控制流要点：
+- 图标只收 `{size, active}`，不碰宿主 DOM；自绘 SVG（不 require 宿主 primitives 包，DSH 规则）。
+- `order`: 插件 0 / 自动化任务 10（已发布的两个），AZ8 取 20，排在它们之后。
+- 主面板页要在 macOS 上避开红绿灯：页头 `padding-top` 加 `var(--dsh-frame-top-clearance, 0px)`（照已发布页面的做法）。
+- **不从主面板页直接打开右栏页签**：右栏按会话停靠，全局面板在屏时 `ctx.sidebarRight.mounted` 为 undefined，
+  `openTab` 会抛错；要"贴着对话看"就回对话（`selectPanel(null)`）再用原有的右栏入口。不给会抛错的按钮。
+- 两个入口共用一份 UI：`Az8Panel` 加 `variant`（`"dock"` 默认 / `"page"`），只差外层布局（页宽上限、资产网格列数自适应），
+  不复制组件、不复制样式表（CSS 仍只在 `<style>` 里注入一次，类名前缀 `az8-`）。
+- 可卸载性：两条注册都走 `ctx.slots.inject` + `ctx.effect` 语义（`inject` 的回调在声明消失时自动注销）。
+
 ## 5. 控制流：生成状态机
 
 状态枚举（journal.status）与转移：
@@ -299,7 +328,7 @@ login态(已配) ─ session ─ definitions ─ target ─ plan ─ ─gate─ 
 | panel.js | `installPanelWeb(ctx, deps)` | webServer 路由：GET state/credits/media，POST set-settings；localhost-only + Origin 校验（照搬 dsh-myinfo 语义） |
 | tools.js | `buildTools()` → 6 个定义 | §8 工具契约；render 给可读 markdown；presentationMeta 标 sync/background |
 | index.js | `apply/inject/Config` | 装配 + `inject:['tools']`；Config=schemastery（defaultProjectId 等） |
-| client.js | `__ModuleLoader__.load` 工厂 | 右侧 dock 三页签 + settings.section；React=h；locale 服务可选 |
+| client.js | `__ModuleLoader__.load` 工厂 | 左栏入口 `sidebar.panellist` + 主面板页 `main[key=dsh-az8]`（§4.5，v0.2.4）；右侧 dock 三页签 + settings.section；React=h；locale 服务可选 |
 
 ## 8. 工具契约（agent-facing）
 
@@ -338,6 +367,8 @@ login态(已配) ─ session ─ definitions ─ target ─ plan ─ ─gate─ 
 4. `test/orchestrator.test.mjs` 详情用例（v0.2.3，第 8–12 组）：中间产物按血缘且排除最终产物、
    老 run 从 history 回填 config/时间线（多代 history 严格按 workflowRunId 选）、facts 落盘后
    详情零 CLI、多输出工作流的中间产物按 coreNodeId 预览且不重复下载、步骤着色、余额不足提示。
+4b. `client.js` 结构自检（`node --check` 之外的轻量断言，`npm test` 里跑）：apply 里两条注册同名 id、
+    图标组件是纯函数（只读 props.size/active）、页面组件复用 Az8Panel、CSS 花括号配对、不 require 宿主包。
 5. UI 验收只认**已安装插件的真实页面**（DSH 官方指引：mock 页截图不算验证）。安装前可以用
    "真 journal 副本 + 真机抓包回放给新代码"挡明显错误，但那只是自检，不是验收（§13b-9/11）。
 
@@ -408,7 +439,12 @@ cli → store → skills → orchestrator → panel → tools → index → clie
     `data-theme` 只保留 token 表达不了的差异（弱化文字档位、阴影强度）；灯箱遮罩刻意压暗，不跟主题。
     `theme` 服务只有 `getTheme()` 没有 subscribe，ThemeSnapshot 形态拿不到（inspect 不接受 input），
     所以不依赖它的结构。
-13. **r1–r3 的失败形态**（11-09 冒烟）：三条都停在 plan（`plan-empty`），目标节点是
+13. **左栏入口的两个尺寸与可取消固定**（读 `dsh-client-ui-sidebar/src/client/SidebarRoot.tsx`，2026-11-26）：
+    图标按行宽收到 `size`：展开 16px、收起栏 18px；行自己有 `aria-hidden` 的字形跨度和标签，图标里再加
+    `aria-hidden` 是对的（否则读屏读两遍）。用户可以在行的 More 菜单里「取消固定」这个入口，之后从 More 菜单打开——
+    这是宿主行为，插件不参与。label 支持 `string | (() => string)`，`locale` 字段是给绑定了 ctx.locale 命名空间的
+    插件用的，本面板用自己的 `t()`，不传。
+14. **r1–r3 的失败形态**（11-09 冒烟）：三条都停在 plan（`plan-empty`），目标节点是
     `data.creationIntent:"blank"` 的空白生成目标，`history` 为空、没有 `resolvedCoreNodeId`。
     回填对它们无事可做（只补 targetAt），步骤显示「规划报价」红色 + 其后空心。这三个空白
     节点还留在 Blank Reel 画布上（y=2600 一排），是用户画布上的调试残留，清理由用户决定。

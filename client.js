@@ -15,6 +15,9 @@ const STATE_ROUTE = `${BASE}/state`;
 const CREDITS_ROUTE = `${BASE}/credits`;
 const DOCK_ID = "dsh-az8-dock";
 const DOCK_KIND = "az8.generation";
+// 左栏入口行与中栏主面板页共用这一个 id（design §4.5）；已发布的两个面板 order 是 0 和 10。
+const PANEL_ID = "dsh-az8";
+const PANEL_ORDER = 20;
 
 // ---------------------------------------------------------------------------
 // i18n（跟随 harness 界面语言；locale 是可选服务）
@@ -343,6 +346,22 @@ const CSS = `
   border-color:color-mix(in srgb,var(--orange) 22%,transparent);}
 .az8-credits.low .dot{background:var(--orange);box-shadow:0 0 6px var(--orange);}
 
+/* —— 主面板页（variant="page"，design §4.5）：同一套组件，换成页宽布局 —— */
+.az8-page{--page-gutter:32px;}
+.az8-page .az8-head{padding:calc(14px + var(--dsh-frame-top-clearance,0px)) var(--page-gutter) 10px;
+ padding-left:max(var(--page-gutter),var(--dsh-frame-leading-clearance,0px));}
+.az8-page .az8-mark{width:30px;height:30px;border-radius:9px;font-size:10.5px;}
+.az8-page .az8-title{font-size:20px;font-weight:500;line-height:28px;letter-spacing:0;}
+.az8-page .az8-seg{display:inline-flex;margin:6px var(--page-gutter) 18px;
+ margin-left:max(var(--page-gutter),var(--dsh-frame-leading-clearance,0px));}
+.az8-page .az8-seg button{padding:5px 18px;}
+.az8-page .az8-body{padding:0 var(--page-gutter) 40px;}
+.az8-page .az8-body > *{max-width:1080px;margin-left:auto;margin-right:auto;}
+.az8-page .az8-runs{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));align-items:start;}
+.az8-page .az8-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;}
+.az8-page .az8-steps .az8-step{padding:8px 14px;}
+@media (max-width:640px){.az8-page{--page-gutter:16px;}.az8-page .az8-runs{grid-template-columns:1fr;}}
+
 /* —— 灯箱 —— */
 /* 灯箱遮罩故意压暗（图片查看器惯例：浅色主题下也要有对比），这是刻意不跟主题的一处 */
 .az8-lightbox{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;cursor:zoom-out;
@@ -665,7 +684,17 @@ function SettingsTab({ snapshot, reload }) {
 	);
 }
 
-function Az8Panel(props, ctx) {
+/** 左栏入口图标：细线描的圆角方块 + "A8"，颜色跟随所在行（currentColor），不画自己的底色。 */
+function Az8PanelIcon({ size, active }) {
+	const edge = Number(size) > 0 ? Number(size) : 20;
+	return h("svg", { className: "az8-panel-icon", width: edge, height: edge, viewBox: "0 0 20 20", "aria-hidden": "true", focusable: "false" },
+		// 宿主按行宽给尺寸：展开 16px / 收起栏 18px（ui-sidebar SidebarRoot.tsx）。16px 下字要够粗才认得出。
+		h("rect", { x: 2.6, y: 2.6, width: 14.8, height: 14.8, rx: 4.6, fill: active ? "currentColor" : "none", stroke: "currentColor", strokeWidth: 1.6, opacity: active ? 0.16 : 1 }),
+		h("text", { x: 10, y: 13.7, textAnchor: "middle", fill: "currentColor", fontSize: 7.9, fontWeight: 800, fontFamily: "-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif", letterSpacing: 0 }, "A8"),
+	);
+}
+
+function Az8Panel(props, ctx, variant = "dock") {
 	const [tab, setTab] = useState("runs");
 	const [snapshot, setSnapshot] = useState(null);
 	const [credits, setCredits] = useState(null);
@@ -709,7 +738,8 @@ function Az8Panel(props, ctx) {
 
 	const balance = (credits?.credits ?? [])[0];
 	const tabs = [["runs", "az8-tab-runs", t("tab.runs")], ["assets", "az8-tab-assets", t("tab.assets")], ["settings", "az8-tab-settings", t("tab.settings")]];
-	return h("div", { className: "az8", "data-theme": theme, ref: rootRef },
+	return h("div", { className: variant === "page" ? "az8 az8-page" : "az8", "data-theme": theme, ref: rootRef,
+		"aria-label": variant === "page" ? "az8-page" : undefined },
 		styleTag,
 		h("div", { className: "az8-head" },
 			h("div", { className: "az8-mark" }, "A8"),
@@ -758,6 +788,13 @@ function apply(ctx) {
 		label: () => t("nav.title"),
 		inject: () => ({}),
 	}, (props) => SettingsSection(props, ctx)));
+	// 左栏入口 + 中栏主面板页：两条注册同一个 id（design §4.5）。点击行由 layout 选中面板，插件不碰导航 DOM。
+	ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
+		name: "sidebar.panellist", id: PANEL_ID, order: PANEL_ORDER, label: () => t("nav.title"),
+	}, (iconProps) => Az8PanelIcon(iconProps)));
+	ctx.slots.inject("main", () => ctx.slots.register({
+		name: "main", key: PANEL_ID,
+	}, (pageProps) => Az8Panel(pageProps, ctx, "page")));
 	ctx.inject(["sidebarRightTabs"], (dock) => {
 		const tabsService = serviceOf(dock, "sidebarRightTabs");
 		if (tabsService === undefined || typeof tabsService.register !== "function") return;
