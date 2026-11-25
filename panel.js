@@ -2,7 +2,9 @@
  * dsh-az8 — 面板 API 与媒体路由（docs/design.md §4.2）。
  *
  * GET  /_dsh/dsh-az8/state    面板全量快照（settings + projects + runs + assets）
- * GET  /_dsh/dsh-az8/credits  活查余额（60s 缓存）
+ * GET  /_dsh/dsh-az8/credits  活查余额（5 分钟缓存；journal 齐全的 run 详情零 CLI）
+ * GET  /_dsh/dsh-az8/detail?run=r9  运行详情：流程时间线 / 工作流 / 参数 / 产物 / 中间产物（design §4.3）
+ * GET  /_dsh/dsh-az8/cache?node=&ext=  中间产物与引用的预览缓存
  * GET  /_dsh/dsh-az8/media?id=a9  产物媒体流（assetId 索引寻址，Range/206，视频可拖）
  * POST /_dsh/dsh-az8/state    { action: 'set-settings', patch }（校验走 store.settingsPatch）
  *
@@ -239,7 +241,15 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 				const runId = String(url.searchParams.get('run') ?? '');
 				if (runId === '') { sendJson(response, 400, { ok: false, error: 'missing ?run=<runId>' }); return; }
 				const detail = await orch.runDetail(runId);
-				sendJson(response, 200, { ok: true, ...detail });
+				// 媒体 URL 在这里补（orchestrator 不认识路由）：产物按 asset.id，引用按 assetId。
+				// 中间产物 / 画布引用的预览 URL 由 orchestrator 落 cache 时给出（item.url）。
+				const withUrl = (item) => ({ ...item, url: item.url ?? (item.assetId ? MEDIA_URL(item.assetId) : item.id ? MEDIA_URL(item.id) : '') });
+				sendJson(response, 200, {
+					...detail, ok: true,
+					assets: (detail.assets ?? []).map(withUrl),
+					inputs: (detail.inputs ?? []).map(withUrl),
+					intermediates: (detail.intermediates ?? []).map(withUrl),
+				});
 			}),
 		}));
 
@@ -255,6 +265,7 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 					return;
 				}
 				const url = new URL(request.url ?? '/', 'http://localhost');
+				// 预览缓存 key：v_<viewNodeId> / c_<coreNodeId>（orchestrator.previewCanvasNode 落盘时生成）
 				const node = String(url.searchParams.get('node') ?? '').replace(/[^a-zA-Z0-9_-]/g, '_');
 				const ext = String(url.searchParams.get('ext') ?? 'bin').replace(/[^a-zA-Z0-9]/g, '');
 				if (node === '') { sendJson(response, 400, { ok: false, error: 'missing ?node=' }); return; }
@@ -262,6 +273,7 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 				const file = join(store.getCacheDir(), `${node}.${ext}`);
 				try {
 					const info = await stat(file);
+					if (info.size === 0) { response.writeHead(404, { 'cache-control': 'no-store' }); response.end(); return; }
 					const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
 						: ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : ext === 'mp4' ? 'video/mp4'
 						: ext === 'webm' ? 'video/webm' : ext === 'mp3' ? 'audio/mpeg' : ext === 'wav' ? 'audio/wav'

@@ -78,7 +78,12 @@
       "assets": ["a9"],            // 产物 asset id 列表
       "startedAt": "…", "endedAt": "…",
       "error": null,               // { code, message, classification }
-      "confirm": null              // awaiting_confirm 时挂 { planSummary, estimate }
+      "confirm": null,             // awaiting_confirm 时挂 { estimate, canAfford, maxCredits, planOps }
+      "detail": null,              // v0.2.1 plan 时落盘：{ definition, config, configFields }（§4.3）
+      "facts": null,               // v0.2.3 终态 Run 事实瘦身快照（scrub：去 URL/凭证键/长串），详情页免打 CLI
+      "timeline": {},              // v0.2.3 阶段时间 ISO：{ targetAt, plannedAt, submittedAt }
+      "references": [],            // v0.2.3 plan 时解析好的引用 [{ viewNodeId, slotName? }]（血缘上游）
+      "enriched": false            // v0.2.3 老 run 是否已从画布 history 回填过（一次性）
     }
   ],
   "assets": [                      // 下载到本地的产物索引
@@ -122,8 +127,8 @@ skills/<slug>/            // slug = 定义名/场景的 kebab-case，如 gpt-ima
 | 身份/余额 | `az8 whoami` / `az8 credits` | 读 |
 | 项目 | `az8 projects list --scope owned` / `get <id>` | 读 |
 | 会话 | `az8 session open <pid>` / `current` / `close` / `resynchronize` | 载体 |
-| 目录 | `az8 canvas query <pid> workflowDefinitions.summary --workflow-target T --workflow-capability C --workflow-search S --page-size N`（follow `pagination.nextCursor`） | 读 |
-| 画布读 | session query `canvas.detail --view-node-id` / `capabilities.summary` | 读 |
+| 目录 | `az8 canvas query <pid> workflowDefinitions.summary --workflow-target T --workflow-capability C --workflow-search S --page-size N`（follow `pagination.nextCursor`；条目 `{id,name,capability,target,group,version}`，`--workflow-search <definitionId>` 可反查名字） | 读 |
+| 画布读 | session query `canvas.detail --view-node-id V`（**只返回 V 这一个节点**，含 `resolvedCoreNodeId` 与 `history[]`）/ `canvas.summary`（全画布节点清单，与单次 run 无血缘）/ `capabilities.summary` | 读 |
 | 生成操作链 | session operation `createGenerationTarget` → `planGeneration`(detail) → plan.operations(`addReference`/`removeReference`/`insertPromptReference` 按 plan 原样) → `startGeneration` | 写(除 plan) |
 | 运行 | session query `getWorkflowRun --workflow-run-id` / operation `waitWorkflowRun`（单窗口） | 读/等 |
 | 媒体 | `az8 canvas download <pid> --view-node-id V --output F` / `az8 canvas upload <pid> --file F --idempotency-key K --position-x/y` | 下载/上传 |
@@ -164,11 +169,46 @@ client.js 轮询(pollMs) ──GET /state──▶ panel.js ──▶ store 只�
   运行页签: runs[] 状态徽章/credits/耗时 + 手动刷新按钮（顺带触发 credits 活查）
   资产页签: assets[] 网格（<img src=media?id> / <video controls>）+ 点击放大
   设置页签: 表单 ──POST set-settings──▶ store.mutate（校验后原子写）
-credits 徽标: GET /credits → cli.js `az8 credits`（60s 内用缓存）
-媒体: GET /media?id=a9 → assets 索引定位绝对路径 → 本地文件流（Range 206，视频可拖）
+credits 徽标: GET /credits → cli.js `az8 credits`（5 分钟缓存 + whoami 10 分钟缓存，见 §13b-5）
+ 媒体: GET /media?id=a9 → assets 索引定位绝对路径 → 本地文件流（Range 206，视频可拖）
+ 运行详情: GET /detail?run=r17 → orchestrator.runDetail（§4.3）；GET /cache?node=&ext= → 中间产物预览缓存
 ```
 
-### 4.3 引用图流（img2img / 首末帧）
+### 4.3 运行详情流（面板点开一条 run）
+
+```
+GET /detail?run=r17
+  ① facts    journal.facts（终态已落盘）‖ getWorkflowRun（老 run 活查一次后回填）
+  ② history  老 run 且缺 detail/timeline 时：canvas.detail(viewNodeId)
+              → history[] 中 runtime.instanceIds 含本次 workflowRunId 的那条（严格按 id 匹配，匹配不上不猜）
+              → inputs.slots.{prompt,config}[].content 是生成时的字面量 → 回填 detail.config / timeline
+              新 run 在生成时已落 detail/timeline/references/facts → 这一步零 CLI
+  ③ name     definitionName 为空且 definitionId 已知 → workflowDefinitions.summary --workflow-search <id>
+              精确命中后回填一次（进程内再缓存 30 分钟）
+  ④ build    纯函数 buildRunDetail：workflow / steps / assets / inputs / outputs / intermediates / notes
+  ⑤ preview  intermediates 非空才按 coreNodeId 下载到 cache（≤3 个；磁盘已有则复用，不重复下载）
+```
+
+**中间产物的定义（按血缘，不按画布邻近）**：`facts.outputs[]` 里 `coreNodeId` 不在本 run
+资产索引中的条目。依据 §13b-6/7：`canvas.detail` 只给目标节点本身，`canvas.summary` 的其余
+节点是用户画布内容、与本次 run 无血缘，不得冒充中间产物。单步工作流（如文生图）outputs
+只有最终产物 → `intermediates = []`，面板明示"单步工作流没有中间产物"。
+
+**流程步骤（steps，全部由真实时间戳推导，缺时间的步骤不显示时间）**
+
+| key | 到达条件 | at | 附带 |
+|---|---|---|---|
+| target | `viewNodeId ≠ ''` | timeline.targetAt | 节点短 id |
+| plan | 已报价 / 已确认 / 已有 workflowRunId | timeline.plannedAt | 报价、实耗 credits |
+| submit | `workflowRunId ≠ ''` | timeline.submittedAt | Run 短 id |
+| run | facts 终态成功 | facts.startedAt | 耗时、progress |
+| assets | `assets.length > 0` | 最晚 downloadedAt | 个数、总字节 |
+
+状态着色：`done` 绿 / `active` 蓝（当前所处阶段）/ `wait` 橙（awaiting_confirm、needs-choice）/
+`failed` 红（第一个未满足的步骤，附 error.message）/ `unknown` 橙（indeterminate）/ `skipped` 空心。
+非终态 run 不落 facts，每次详情都活查（indeterminate 的活查结果就是 reconcile 证据）。
+
+### 4.4 引用图流（img2img / 首末帧）
 ```
 args.references[] 三种来源统一折算成 viewNodeId：
   source=file(path)   → canvas upload（幂等键=文件 sha256 前 16）→ Receipt 取 viewNodeId
@@ -293,6 +333,11 @@ login态(已配) ─ session ─ definitions ─ target ─ plan ─ ─gate─ 
 1. `test/store.test.mjs`：水位线、裁剪、原子写、settings 校验。
 2. `test/orchestrator.test.mjs`：注入 fake cli（脚本桩），覆盖状态机全转移 + 闸门 + exit2 停链。
 3. 真机冒烟（手动，一次）：definitions → generate(image, 最便宜) → 面板资产页出现 → 对话内出图。
+4. `test/orchestrator.test.mjs` 详情用例（v0.2.3，第 8–12 组）：中间产物按血缘且排除最终产物、
+   老 run 从 history 回填 config/时间线（多代 history 严格按 workflowRunId 选）、facts 落盘后
+   详情零 CLI、多输出工作流的中间产物按 coreNodeId 预览且不重复下载、步骤着色、余额不足提示。
+5. UI 验收只认**已安装插件的真实页面**（DSH 官方指引：mock 页截图不算验证）。安装前可以用
+   "真 journal 副本 + 真机抓包回放给新代码"挡明显错误，但那只是自检，不是验收（§13b-9/11）。
 
 ## 12. 开发顺序（按 §6.1 拓扑）
 
@@ -319,3 +364,41 @@ cli → store → skills → orchestrator → panel → tools → index → clie
 
 冒烟结果：r4（GPT-Image-2 文生图，报价 6）全链路 succeeded → 产物 a1（85,667 B PNG）
 经 `/_dsh/dsh-az8/media?id=a1` 出图（200/206 Range 均通过）。
+
+### 13b. 复盘校准记录（2026-11-25，v0.2.3）
+
+5. **reauthentication-required 的根因是进程并发**：11-11 / 11-21 / 11-25 三次吊销都发生在
+   多个 az8 进程同时跑（Promise.all + 60s 轮询）时——refresh token 轮换被服务端判重用。
+   修法：cli.js 进程内全局串行 + credits 5 分钟缓存 + whoami 10 分钟缓存。串行后连续观察
+   30+ 分钟、详情/余额路由多次调用未再吊销。手动 `az8` 命令与插件是两个进程、不共享这把锁，
+   所以手动查询前先打一次 `/credits` 刷新 TTL，腾出 5 分钟安静窗口，且只做串行的只读查询。
+6. **`canvas.detail --view-node-id` 只返回该节点**（r4 实测 `viewNodes ×1`），不是"附近节点"：
+   ```
+   viewNodes[0] = { id, type:"resource", contentType:"image", source:"generated",
+     createdAt, updatedAt, position, resolvedCoreNodeId, draft(null), data:{prompt},
+     history:[{ id:"generation_draft_…", definitionId, createdAt, updatedAt,
+       inputs:{ slots:{ prompt:[{kind:"literal",assetType:"text",content}],
+                       config:[{kind:"literal",assetType:"json",content:"<json 串>"}] } },
+       runtime:{ expectedCost, expectedDefinitionVersion, instanceIds:[workflowRunId],
+                 materializedInputs:{…coreNodeIds}, submittedAt } }] }
+   ```
+   v0.2.1 的"中间产物"扫这份 payload 再按 coreNodeId 排除，而节点 id 是 viewNodeId，
+   永远排除不掉 → r4 的"中间产物"就是最终产物本身（sha256 一致）。
+7. **`canvas.summary` 与单次 run 无血缘**：Blank Reel 有 34 个节点（分镜组 22 + 5 + 散点），
+   都是用户内容，不能当中间产物。中间产物只能按 outputs 血缘取（§4.3）。
+8. **定义目录条目**：`{id,name,capability,target,group,version}`，按 definitionId 子串搜索
+   精确命中（`11265c29…` → GPT-Image-2 / text-to-image / gpt_lmage_2 / v38）；目录共 196 个
+   （image 44 / video 124 / audio 8 / text 12 / world 8）。`getWorkflowRun` capability：
+   `effect:"read"`、`retry:"bounded-read"`、入参仅 `{workflowRunId}`；outputs 的 `role`
+   真机为空串，多步工作流的取值待校准。
+9. **预览服务器造过假数据**：v0.2.1 的预览把最终产物塞进 intermediates、手写了 detail，
+   截图"看起来对"但线上 r4 实际是 `def: None / config: None`。规则改为：UI 验收只认已安装
+   插件的真实页面；回放（真数据喂新代码）只能自检，不能当验收（§11-5）。
+10. **账号订阅 pro → free，`az8 credits` 的 availableCredits = 0**。闸门提示要区分
+    "超闸门"与"余额不足"（canAfford=false 时让用户确认没有意义）。
+11. **回放自检挡掉的一个真 bug**：详情里的产物条目键是 `id`，路由补 URL 时却只认 `assetId`，
+    缩略图全空。修法：路由对 assets 按 `id`、对 inputs 按 `assetId` 补 URL，client 再兜底一层。
+12. **r1–r3 的失败形态**（11-09 冒烟）：三条都停在 plan（`plan-empty`），目标节点是
+    `data.creationIntent:"blank"` 的空白生成目标，`history` 为空、没有 `resolvedCoreNodeId`。
+    回填对它们无事可做（只补 targetAt），步骤显示「规划报价」红色 + 其后空心。这三个空白
+    节点还留在 Blank Reel 画布上（y=2600 一排），是用户画布上的调试残留，清理由用户决定。

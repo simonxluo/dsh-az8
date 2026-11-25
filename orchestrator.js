@@ -6,7 +6,7 @@
  * JSON Schema 自适应映射（design §7），映射不了的留给服务端校验并透传可读错误。
  */
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { run as defaultCliRun } from './cli.js';
@@ -62,6 +62,207 @@ function cliErr(result, what) {
 	error.classification = result.classification;
 	error.retryable = jsonErr?.retryable === true;
 	return error;
+}
+
+/**
+ * 终态 Run 事实瘦身（design §2.1 facts / §4.3）：只留详情页要用的顶层键，
+ * URL/凭证样键名不落盘，字符串里的链接抹成 [url]，超长串截断。
+ */
+const FACT_KEYS = ['id', 'status', 'createdAt', 'startedAt', 'endedAt', 'updatedAt', 'progress', 'definitionId', 'definitionVersion', 'outputs', 'usage', 'error', 'asyncTaskId'];
+const FACT_SKIP_KEY = /url|token|secret|signature|credential|authorization|cookie/i;
+export function scrubFacts(value, depth = 0) {
+	if (value === null || typeof value !== 'object') {
+		if (typeof value !== 'string') return value;
+		const text = value.length > 400 ? value.slice(0, 400) + '…' : value;
+		return /https?:\/\//i.test(text) ? text.replace(/https?:\/\/\S+/gi, '[url]') : text;
+	}
+	if (depth > 6) return undefined;
+	if (Array.isArray(value)) {
+		return value.slice(0, 24).map((item) => scrubFacts(item, depth + 1)).filter((item) => item !== undefined);
+	}
+	const out = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (FACT_SKIP_KEY.test(key)) continue;
+		if (depth === 0 && !FACT_KEYS.includes(key)) continue;
+		const cleaned = scrubFacts(item, depth + 1);
+		if (cleaned !== undefined) out[key] = cleaned;
+	}
+	return out;
+}
+
+/** Run 事实的终态判定：活查到的 facts 可能比 journal 新，以它为第二意见。 */
+export function terminalStateOf(runJson) {
+	const status = String(pickString(runJson, ['status']) ?? '').toLowerCase();
+	if (['succeeded', 'success', 'completed', 'done'].includes(status)) return 'succeeded';
+	if (['failed', 'error', 'cancelled', 'canceled'].includes(status)) return 'failed';
+	if (['pending', 'running', 'queued'].includes(status)) return 'running';
+	return 'unknown';
+}
+
+const STEP_KEYS = ['target', 'plan', 'submit', 'run', 'assets'];
+const JOURNAL_TERMINAL = new Set(['succeeded', 'failed', 'indeterminate']);
+const ACTIVE_STEP = { resolving: 'target', planning: 'plan', starting: 'submit', running: 'run', downloading: 'assets' };
+
+const toMs = (value) => {
+	if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+	const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+	return Number.isFinite(ms) ? ms : 0;
+};
+const toIso = (value) => {
+	const ms = toMs(value);
+	return ms > 0 ? new Date(ms).toISOString() : '';
+};
+
+/**
+ * 画布目标节点 history[] 里属于本次 run 的那一条：严格按 runtime.instanceIds 匹配，
+ * 匹配不上返回 undefined——节点上可能有多代生成，按时间猜会张冠李戴。
+ */
+export function pickHistory(node, run) {
+	const history = Array.isArray(node?.history) ? node.history : [];
+	if (run.workflowRunId === '') return undefined;
+	return history.find((entry) => Array.isArray(entry?.runtime?.instanceIds) && entry.runtime.instanceIds.includes(run.workflowRunId));
+}
+
+/**
+ * 老 run（v0.2.2 之前生成，journal 里没有 detail/timeline）从画布 history 回填。
+ * 只补缺失字段，不覆盖已有；返回可直接进 patchRun 的对象。
+ */
+export function backfillFromHistory(run, node, entry) {
+	const patch = { timeline: { ...(run.timeline ?? {}) } };
+	if ((run.timeline?.targetAt ?? '') === '' && toIso(node?.createdAt) !== '') patch.timeline.targetAt = toIso(node.createdAt);
+	if (entry === undefined) return patch;
+	const definitionId = String(entry.definitionId ?? run.definitionId ?? '');
+	if (run.definitionId === '' && definitionId !== '') patch.definitionId = definitionId;
+	if ((run.timeline?.plannedAt ?? '') === '') patch.timeline.plannedAt = toIso(entry.createdAt);
+	if ((run.timeline?.submittedAt ?? '') === '') patch.timeline.submittedAt = toIso(entry.runtime?.submittedAt ?? entry.updatedAt);
+	const slots = entry.inputs?.slots ?? {};
+	const literal = (name) => (Array.isArray(slots[name]) ? slots[name] : []).find((x) => x?.kind === 'literal' && typeof x.content === 'string')?.content;
+	if (Object.keys(run.detail?.config ?? {}).length === 0) {
+		let config = {};
+		try {
+			const parsed = JSON.parse(literal('config') ?? '');
+			if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) config = parsed;
+		} catch { /* config 字面量不是 JSON 对象就留空 */ }
+		patch.detail = { ...(run.detail ?? {}), config, configFields: run.detail?.configFields ?? [] };
+	}
+	// 引用槽的真机形态还没校准（§13b-8）：只认非字面量且带 viewNodeId 类字段的条目，认不出就留空。
+	if (!Array.isArray(run.references)) {
+		const refs = [];
+		for (const [slot, items] of Object.entries(slots)) {
+			if (!Array.isArray(items)) continue;
+			for (const item of items) {
+				if (item?.kind === 'literal') continue;
+				const viewNodeId = String(item?.viewNodeId ?? item?.referenceViewNodeId ?? '');
+				if (viewNodeId === '' || refs.some((r) => r.viewNodeId === viewNodeId)) continue;
+				refs.push({ viewNodeId, slotName: String(item?.slotName ?? slot) });
+			}
+		}
+		patch.references = refs;
+	}
+	return patch;
+}
+
+/**
+ * 运行详情组装（纯函数，单测直接覆盖）：journal run + 权威 facts + 全量 state（串血缘）
+ * → 面板 JSON。不碰 CLI、不碰磁盘；预览 URL 由 orchestrator/panel 补。
+ */
+export function buildRunDetail(run, facts, state = { runs: [], assets: [] }) {
+	const assets = (run.assets ?? []).map((id) => state.assets.find((a) => a.id === id)).filter(Boolean);
+	const assetByCore = new Map(assets.map((a) => [a.coreNodeId, a]));
+	const outputs = Array.isArray(facts?.outputs) ? facts.outputs : [];
+	const seenCore = new Set();
+	const outRows = [];
+	const intermediates = [];
+	for (const item of outputs) {
+		const coreNodeId = String(item?.coreNodeId ?? '');
+		if (coreNodeId === '' || seenCore.has(coreNodeId)) continue;
+		seenCore.add(coreNodeId);
+		const row = { coreNodeId, slotName: String(item?.slotName ?? ''), role: String(item?.role ?? '') };
+		const asset = assetByCore.get(coreNodeId);
+		if (asset !== undefined) outRows.push({ ...row, assetId: asset.id });
+		else intermediates.push(row); // 中间产物 = 本次 outputs 里没入库的条目（§4.3：按血缘，不按画布邻近）
+	}
+	const definition = run.detail?.definition ?? {};
+	const workflow = {
+		definitionId: String(run.definitionId || definition.id || facts?.definitionId || ''),
+		definitionName: String(run.definitionName ?? definition.name ?? ''),
+		capability: String(definition.capability ?? ''),
+		group: String(definition.group ?? ''),
+		definitionVersion: facts?.definitionVersion ?? definition.version ?? null,
+		note: '',
+	};
+	if (workflow.definitionId === '' && outputs.length === 0 && run.viewNodeId === '' && JOURNAL_TERMINAL.has(run.status)) workflow.note = 'not-planned';
+
+	// 引用（血缘上游）：引用的 viewNode 若是更早一条 run 的生成目标，标出 upstreamRunId
+	const runByTarget = new Map(state.runs.filter((r) => typeof r.viewNodeId === 'string' && r.viewNodeId !== '').map((r) => [r.viewNodeId, r]));
+	const inputs = [];
+	for (const ref of Array.isArray(run.references) ? run.references : []) {
+		const viewNodeId = String(ref?.viewNodeId ?? '');
+		if (viewNodeId === '' || inputs.some((x) => x.viewNodeId === viewNodeId)) continue;
+		inputs.push({ viewNodeId, slotName: String(ref?.slotName ?? ''), upstreamRunId: runByTarget.get(viewNodeId)?.id ?? '', assetId: '' });
+	}
+
+	// 五个阶段（§4.3）：第一个没走到的步骤才是 failed/unknown/wait/active，其后一律 skipped
+	const factsState = terminalStateOf(facts);
+	const ok = {
+		target: run.viewNodeId !== '',
+		plan: run.creditsEstimated != null || run.confirm != null || run.workflowRunId !== '',
+		submit: run.workflowRunId !== '',
+		run: run.status === 'succeeded' || factsState === 'succeeded',
+		assets: assets.length > 0,
+	};
+	const states = {};
+	let stopped = false;
+	for (const key of STEP_KEYS) {
+		if (!stopped && ok[key]) { states[key] = 'done'; continue; }
+		if (!stopped) {
+			stopped = true;
+			states[key] = run.status === 'failed' ? 'failed'
+				: run.status === 'indeterminate' ? 'unknown'
+				: run.status === 'awaiting_confirm' || run.status === 'needs-choice' ? 'wait'
+				: JOURNAL_TERMINAL.has(run.status) ? 'skipped'
+				: ACTIVE_STEP[run.status] === key ? 'active' : 'skipped';
+		} else states[key] = 'skipped';
+	}
+	const tl = run.timeline ?? {};
+	const durationMs = toMs(facts?.endedAt ?? facts?.updatedAt) - toMs(facts?.startedAt ?? facts?.createdAt);
+	const bytes = assets.reduce((sum, a) => sum + (Number(a.bytes) || 0), 0);
+	const lastDownload = assets.map((a) => a.downloadedAt).filter(Boolean).sort().at(-1);
+	const withError = (step) => ((step.state === 'failed' || step.state === 'unknown') && run.error?.message
+		? { ...step, error: firstLine(run.error.message, 160) } : step);
+	const steps = STEP_KEYS.map((key) => withError({ key, state: states[key] }));
+	Object.assign(steps[0], { at: toIso(tl.targetAt), id: run.viewNodeId });
+	Object.assign(steps[1], { at: toIso(tl.plannedAt), estimate: run.creditsEstimated ?? null, actual: run.creditsActual ?? null });
+	Object.assign(steps[2], { at: toIso(tl.submittedAt), id: run.workflowRunId });
+	Object.assign(steps[3], { at: toIso(facts?.startedAt ?? facts?.createdAt), durationMs: durationMs > 0 ? durationMs : null, progress: typeof facts?.progress === 'number' ? facts.progress : null });
+	Object.assign(steps[4], { at: lastDownload ? toIso(lastDownload) : '', count: assets.length, bytes });
+
+	// notes 是给面板翻译的码，不在这里写死中文/英文
+	const notes = [];
+	if (run.status === 'succeeded' && assets.length === 0) notes.push('no-assets');
+	if (run.status === 'succeeded' && intermediates.length === 0 && outRows.length > 0) notes.push('single-step');
+	if (run.status === 'indeterminate') notes.push('indeterminate');
+	if (run.status === 'awaiting_confirm') notes.push(run.confirm?.canAfford === false ? 'unaffordable' : 'awaiting-confirm');
+	if (!JOURNAL_TERMINAL.has(run.status) && run.status !== 'awaiting_confirm' && run.status !== 'needs-choice' && factsState === 'succeeded') notes.push('unfinished');
+
+	return {
+		run: {
+			id: run.id, status: run.status, target: run.target,
+			projectId: run.projectId, projectName: run.projectName,
+			viewNodeId: run.viewNodeId ?? '', workflowRunId: run.workflowRunId ?? '',
+			startedAt: run.startedAt ?? '', endedAt: run.endedAt ?? '',
+			prompt: run.prompt, error: run.error ?? null, confirm: run.confirm ?? null,
+			creditsEstimated: run.creditsEstimated ?? null, creditsActual: run.creditsActual ?? null,
+		},
+		workflow,
+		config: run.detail?.config ?? {},
+		configFields: Array.isArray(run.detail?.configFields) ? run.detail.configFields : [],
+		steps, inputs,
+		outputs: outRows,
+		intermediates,
+		assets: assets.map((a) => ({ id: a.id, kind: a.kind, filename: a.filename, bytes: a.bytes, mime: a.mime, coreNodeId: a.coreNodeId, slotName: outRows.find((o) => o.coreNodeId === a.coreNodeId)?.slotName ?? '' })),
+		notes,
+	};
 }
 
 export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}) {
@@ -192,7 +393,11 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 
 	async function definitions({ target, capability, search, pageSize = 20, projectId } = {}) {
 		const state = store.loadState();
-		await ensureSession(projectId ?? state.settings.defaultProjectId);
+		// 没给项目且没默认项目时复用当前已开的会话（generate 里就是这么调的）；
+		// 都没有才报错——绝不拿空字符串去 session open。
+		const sessionProject = String(projectId ?? state.settings.defaultProjectId ?? '');
+		if (sessionProject !== '') await ensureSession(sessionProject);
+		else if (sessionRef === null) throw new store.StoreError('查工作流目录需要 projectId（或先在设置里填默认项目）');
 		const args = ['session', 'query', 'workflowDefinitions.summary'];
 		if (target !== undefined) args.push('--workflow-target', target);
 		if (capability !== undefined && capability !== '') args.push('--workflow-capability', capability);
@@ -253,6 +458,7 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		await rename(tmp, finalPath);
 		const asset = {
 			id: assetId, runId, projectId,
+			slotName: String(ref.slotName ?? ''), role: String(ref.role ?? ''),
 			kind, filename, mime, bytes: Number(file.bytes ?? info.bytes ?? 0), sha256: String(file.checksum?.hex ?? info.sha256 ?? ''),
 			viewNodeId: String(ref.viewNodeId ?? ''), coreNodeId: String(ref.coreNodeId ?? info.media?.coreNodeId ?? ''),
 			downloadedAt: new Date().toISOString(),
@@ -277,33 +483,46 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 	 * 画布中间产物预览：按 viewNodeId 下载到 cache 目录并返回相对 URL。
 	 * 供面板「工作流详情」展示非最终产物节点；失败返回 null（预览尽力而为）。
 	 */
-	const previewCache = new Map(); // viewNodeId -> { url, at }
-	async function previewCanvasNode(projectId, viewNodeId, { maxSize = 12 * 1024 * 1024, ttlMs = 10 * 60_000 } = {}) {
-		if (typeof viewNodeId !== 'string' || viewNodeId === '') return null;
-		const cached = previewCache.get(viewNodeId);
-		if (cached !== undefined && Date.now() - cached.at < ttlMs) return cached.url;
+	/**
+	 * 画布节点预览缓存：按 viewNodeId 或 coreNodeId 下载到 cache 目录，返回 { url, kind }。
+	 * 只给详情页的「中间产物 / 引用」用（最终产物走 assets 索引，不进这里）。
+	 * 磁盘已有同名缓存就复用（跨进程重启不重复下载）；失败返回 null，预览尽力而为。
+	 */
+	const PREVIEW_KIND = { png: 'image', jpg: 'image', jpeg: 'image', webp: 'image', gif: 'image', mp4: 'video', webm: 'video', mp3: 'audio', wav: 'audio', m4a: 'audio' };
+	const previewCache = new Map(); // cacheKey -> { url, kind, at }
+	async function previewCanvasNode(projectId, ref, { maxSize = 12 * 1024 * 1024, ttlMs = 10 * 60_000 } = {}) {
+		const viewNodeId = typeof ref?.viewNodeId === 'string' ? ref.viewNodeId : '';
+		const coreNodeId = typeof ref?.coreNodeId === 'string' ? ref.coreNodeId : '';
+		const key = viewNodeId !== '' ? `v_${viewNodeId}` : coreNodeId !== '' ? `c_${coreNodeId}` : '';
+		if (key === '') return null;
+		const cached = previewCache.get(key);
+		if (cached !== undefined && Date.now() - cached.at < ttlMs) return cached;
 		try {
 			const dir = store.getCacheDir();
 			await mkdir(dir, { recursive: true });
-			const file = join(dir, `${viewNodeId.replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`);
-			if (!existsSync(file)) {
-				const result = await call(['canvas', 'download', projectId, '--view-node-id', viewNodeId, '--output', file], 120_000);
-				if (result.exitCode !== 0) return null;
+			const existing = (await readdir(dir)).find((name) => name.startsWith(`${key}.`));
+			let ext = '';
+			let kind = '';
+			if (existing !== undefined) {
+				ext = extname(existing).slice(1);
+				kind = PREVIEW_KIND[ext] ?? '';
+			} else {
+				const tmp = join(dir, `.tmp-${key}-${Date.now()}`);
+				const selector = viewNodeId !== '' ? ['--view-node-id', viewNodeId] : ['--core-node-id', coreNodeId];
+				const result = await call(['canvas', 'download', projectId, ...selector, '--output', tmp], 120_000);
+				if (result.exitCode !== 0) { await rm(tmp, { force: true }); return null; }
 				const info = result.json?.file ?? {};
-				if (Number(info.bytes ?? 0) > maxSize) return null;
+				if (Number(info.bytes ?? 0) > maxSize) { await rm(tmp, { force: true }); return null; }
 				const mime = String(info.contentType ?? '');
-				const ext = String(info.detectedExtension ?? '').replace(/^\./, '') || (mime.split('/')[1] ?? 'bin').split(';')[0];
-				const named = join(dir, `${viewNodeId.replace(/[^a-zA-Z0-9_-]/g, '_')}.${ext}`);
-				await rename(file, named);
-				previewCache.set(viewNodeId, { url: `/_dsh/dsh-az8/cache?node=${encodeURIComponent(viewNodeId)}&ext=${encodeURIComponent(ext)}`, at: Date.now() });
-				return previewCache.get(viewNodeId).url;
+				ext = String(info.detectedExtension ?? '').replace(/^\./, '') || (mime.split('/')[1] ?? 'bin').split(';')[0];
+				kind = mime.split('/')[0];
+				await rename(tmp, join(dir, `${key}.${ext}`));
 			}
-			// 文件已在：从磁盘扩展名恢复 URL。
-			const ext = extname(file).slice(1) || 'bin';
-			previewCache.set(viewNodeId, { url: `/_dsh/dsh-az8/cache?node=${encodeURIComponent(viewNodeId)}&ext=${encodeURIComponent(ext)}`, at: Date.now() });
-			return previewCache.get(viewNodeId).url;
+			const entry = { url: `/_dsh/dsh-az8/cache?node=${encodeURIComponent(key)}&ext=${encodeURIComponent(ext)}`, kind, at: Date.now() };
+			previewCache.set(key, entry);
+			return entry;
 		} catch (error) {
-			log(`previewCanvasNode ${viewNodeId} failed: ${firstLine(error?.message)}`);
+			log(`previewCanvasNode ${key} failed: ${firstLine(error?.message)}`);
 			return null;
 		}
 	}
@@ -374,11 +593,7 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 	}
 
 	function runTerminalState(runJson) {
-		const status = String(pickString(runJson, ['status']) ?? '').toLowerCase();
-		if (['succeeded', 'success', 'completed', 'done'].includes(status)) return 'succeeded';
-		if (['failed', 'error', 'cancelled', 'canceled'].includes(status)) return 'failed';
-		if (['pending', 'running', 'queued'].includes(status)) return 'running';
-		return 'unknown';
+		return terminalStateOf(runJson);
 	}
 
 	async function resolveOutputs(runId, projectId, runJson, viewNodeId) {
@@ -390,8 +605,9 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		for (const hit of deepScan(runJson, (v) => Array.isArray(v.outputs))) {
 			for (const item of hit.outputs) {
 				if (item !== null && typeof item === 'object') {
-					if (typeof item.coreNodeId === 'string' && item.coreNodeId !== '') push({ coreNodeId: item.coreNodeId });
-					else if (typeof item.viewNodeId === 'string' && item.viewNodeId !== '') push({ viewNodeId: item.viewNodeId });
+					const slot = { slotName: String(item.slotName ?? ''), role: String(item.role ?? '') };
+					if (typeof item.coreNodeId === 'string' && item.coreNodeId !== '') push({ coreNodeId: item.coreNodeId, ...slot });
+					else if (typeof item.viewNodeId === 'string' && item.viewNodeId !== '') push({ viewNodeId: item.viewNodeId, ...slot });
 				} else if (typeof item === 'string' && ID_SHAPE.test(item)) push({ coreNodeId: item });
 			}
 		}
@@ -427,11 +643,16 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 									status: 'succeeded', endedAt: new Date().toISOString(),
 									creditsActual: usageCredits,
 									assets: assets.map((a) => a.id),
+									facts: scrubFacts(facts),
 								}));
 								return { status: 'completed', result: `AZ8 ${runId} 生成完成，产物 ${assets.length} 个（面板「资产」页可看）` };
 							}
 							if (terminal === 'failed') {
-								await store.mutate((s) => store.patchRun(s, runId, { status: 'failed', endedAt: new Date().toISOString(), error: { code: 'run-failed', message: firstLine(JSON.stringify(runJson), 300) } }));
+								await store.mutate((s) => store.patchRun(s, runId, {
+									status: 'failed', endedAt: new Date().toISOString(),
+									error: { code: 'run-failed', message: firstLine(JSON.stringify(runJson), 300) },
+									facts: scrubFacts(runJson),
+								}));
 								return { status: 'failed', detail: `AZ8 ${runId} 生成失败` };
 							}
 							return { status: 'completed', result: `AZ8 ${runId} 仍在运行（观察窗口结束），稍后用 az8_runs 查询` };
@@ -456,11 +677,16 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 				status: 'succeeded', endedAt: new Date().toISOString(),
 				creditsActual: usageCredits,
 				assets: assets.map((a) => a.id),
+				facts: scrubFacts(facts),
 			}));
 			return { ...snapshot(runId), assets, via, note: assets.length === 0 ? 'Run 成功但没解析到可下载产物：用 az8_media 手动下载（先 az8_runs get 看 run 事实）' : '' };
 		}
 		if (terminal === 'failed') {
-			await store.mutate((s) => store.patchRun(s, runId, { status: 'failed', endedAt: new Date().toISOString(), error: { code: 'run-failed', message: firstLine(JSON.stringify(runJson), 300) } }));
+			await store.mutate((s) => store.patchRun(s, runId, {
+				status: 'failed', endedAt: new Date().toISOString(),
+				error: { code: 'run-failed', message: firstLine(JSON.stringify(runJson), 300) },
+				facts: scrubFacts(runJson),
+			}));
 			return { ...snapshot(runId), via };
 		}
 		return { ...snapshot(runId), stillRunning: true, via, note: '观察窗口结束仍在运行：稍后用 az8_runs（action: wait）再等一个窗口。' };
@@ -481,7 +707,7 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 				const planOps = existing.confirm?.planOps ?? [];
 				const { workflowRunId } = await executePlanOps(existing.id, planOps);
 				if (workflowRunId === '') throw Object.assign(new Error('plan.operations 执行完但没拿到 workflowRunId'), { classification: 'indeterminate' });
-				await store.mutate((s) => store.patchRun(s, existing.id, { status: 'running', workflowRunId, confirm: null }));
+				await store.mutate((s) => store.patchRun(s, existing.id, { status: 'running', workflowRunId, confirm: null, timeline: { ...(snapshot(existing.id).timeline ?? {}), submittedAt: new Date().toISOString() } }));
 				return finishRun(existing.id, { projectId: existing.projectId, workflowRunId, viewNodeId: existing.viewNodeId, waitMs, mode });
 			}
 
@@ -497,6 +723,7 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 					creditsEstimated: undefined, creditsActual: undefined,
 					assets: [], startedAt: new Date().toISOString(), endedAt: '',
 					error: null, confirm: null,
+					timeline: {}, references: [], detail: null, facts: null, enriched: false,
 				};
 				store.appendRun(state, run);
 				return run.id;
@@ -534,9 +761,10 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 				const { result: targetRes } = await operation('createGenerationTarget', buildInput(targetSchema, { target: args.target }), rid(runId, 'target'));
 				const viewNodeId = pickString(targetRes, ['viewNodeId', 'targetViewNodeId']);
 				if (viewNodeId === '') throw Object.assign(new Error('createGenerationTarget 成功但没解析出 viewNodeId: ' + firstLine(JSON.stringify(targetRes), 200)), { classification: 'indeterminate' });
-				await store.mutate((s) => store.patchRun(s, runId, { viewNodeId, status: 'planning' }));
+				await store.mutate((s) => store.patchRun(s, runId, { viewNodeId, status: 'planning', timeline: { targetAt: new Date().toISOString() } }));
 
 				const refs = await resolveReferences(runId, projectId, args.references);
+				if (refs.length > 0) await store.mutate((s) => store.patchRun(s, runId, { references: refs.map((r) => ({ viewNodeId: r.viewNodeId, slotName: r.slotName ?? '' })) }));
 
 				await requireOp('planGeneration');
 				const planSchema = await opDetail('planGeneration');
@@ -576,9 +804,18 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 				}
 				const estimate = Number(inner.estimate?.credits?.total ?? NaN);
 				const affordable = inner.estimate?.credits?.canAfford ?? true;
-				// 工作流详情落盘：定义元数据 + 生效 config（面板「运行详情」可查）。
+				// 工作流详情 + 报价 + 时间线一次落盘（design §2.1 / §4.3）：面板详情零 CLI 的数据源。
+				// 模型名缺失（显式传 definitionId 时 plan 可能不带 name）→ 目录反查一次，不命中不阻塞生成。
+				const plannedDefinitionId = String(definitionId || inner.definition?.id || inner.definition?.definitionId || '');
+				let plannedDefinition = inner.definition ?? null;
+				if (plannedDefinitionId !== '' && String(plannedDefinition?.name ?? '') === '') {
+					try {
+						const meta = await definitionMetaOf(plannedDefinitionId, projectId);
+						if (meta !== null) plannedDefinition = { ...(plannedDefinition ?? {}), ...meta };
+					} catch (error) { log(`definitionMeta ${plannedDefinitionId} failed: ${firstLine(error?.message)}`); }
+				}
 				const detailMeta = {
-					definition: inner.definition ?? null,
+					definition: plannedDefinition,
 					config: (Array.isArray(inner.configFields)
 						? inner.configFields.filter((f) => typeof f?.name === 'string' && f.value !== undefined).reduce((acc, f) => { acc[f.name] = f.value; return acc; }, {})
 						: {}),
@@ -587,9 +824,11 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 						: [],
 				};
 				await store.mutate((s) => store.patchRun(s, runId, {
+					...(definitionId === '' && plannedDefinitionId !== '' ? { definitionId: plannedDefinitionId } : {}),
 					creditsEstimated: Number.isFinite(estimate) ? estimate : undefined,
-					definitionName: String(inner.definition?.name ?? '') || undefined,
+					definitionName: String(plannedDefinition?.name ?? '') || undefined,
 					detail: detailMeta,
+					timeline: { ...(snapshot(runId).timeline ?? {}), plannedAt: new Date().toISOString() },
 				}));
 				const planOps = Array.isArray(inner.operations) ? inner.operations : [];
 				if (planOps.length === 0) {
@@ -615,13 +854,15 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 					return {
 						...snapshot(runId),
 						needsConfirmation: true,
-						hint: `报价 ${Number.isFinite(estimate) ? estimate : '未知'} credits（闸门 ${maxCredits}）。用户同意后用 az8_generate { resumeRunId: "${runId}", confirmed: true } 继续。`,
+						hint: affordable === false
+						? `报价 ${Number.isFinite(estimate) ? estimate : '未知'} credits，但账号余额不足（canAfford=false）：用户确认也跑不了，先充值或换更便宜的模型。`
+						: `报价 ${Number.isFinite(estimate) ? estimate : '未知'} credits（闸门 ${maxCredits}）。用户同意后用 az8_generate { resumeRunId: "${runId}", confirmed: true } 继续。`,
 					};
 				}
 
 				const { workflowRunId } = await executePlanOps(runId, planOps);
 				if (workflowRunId === '') throw Object.assign(new Error('plan.operations 执行完但没拿到 workflowRunId（最后一步: ' + firstLine(JSON.stringify(planOps.at(-1)?.name ?? ''), 120) + '）'), { classification: 'indeterminate' });
-				await store.mutate((s) => store.patchRun(s, runId, { status: 'running', workflowRunId, confirm: null }));
+				await store.mutate((s) => store.patchRun(s, runId, { status: 'running', workflowRunId, confirm: null, timeline: { ...(snapshot(runId).timeline ?? {}), submittedAt: new Date().toISOString() } }));
 				return finishRun(runId, { projectId, workflowRunId, viewNodeId, waitMs, mode });
 			} catch (error) {
 				await failRun(runId, error);
@@ -656,7 +897,16 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		const credits = await callOk(['credits'], 'credits', 30_000);
 		const projectsJson = await call(['projects', 'list', '--scope', 'owned'], 30_000);
 		const projects = projectsJson.exitCode === 0 && Array.isArray(projectsJson.json?.projects) ? projectsJson.json.projects : [];
-		await store.mutate((s) => store.setProjectsCache(s, projects));
+		await store.mutate((s) => {
+			store.setProjectsCache(s, projects);
+			// 老 run 的 projectName 可能存成了项目 id（当时缓存是空的）：拿到真名就治愈
+			for (const run of s.runs) {
+				if (run.projectId !== '' && (run.projectName === run.projectId || run.projectName === '')) {
+					const name = projects.find((p) => p.id === run.projectId)?.name ?? '';
+					if (name !== '') run.projectName = name;
+				}
+			}
+		});
 		const current = await call(['session', 'current'], 15_000);
 		return {
 			whoami: whoami.account ?? whoami,
@@ -672,51 +922,120 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 	 * journal 快照 + 权威 workflowRun 事实 + 输入/输出节点 + 中间产物预览 URL。
 	 * workflowRunId 缺失（未开始/未到 start）时返回 journal 侧已知部分。
 	 */
+	// --- 运行详情（design §4.3）----------------------------------------------
+	// journal 优先：新 run 的 detail/timeline/references/facts 在生成时已落盘，详情零 CLI。
+	// 老 run（v0.2.2 之前）：活查一次并回填（enriched 标记），之后同样零 CLI。
+	// 非终态 run 不落 facts，每次活查——indeterminate 的活查结果就是 reconcile 证据。
+
+	// 定义元数据进程内缓存（definitionId → { name, capability, … }），只缓存命中，失败下次再查
+	const defMetaCache = new Map();
+	async function definitionMetaOf(definitionId, projectId) {
+		if (definitionId === '') return null;
+		if (defMetaCache.has(definitionId)) return defMetaCache.get(definitionId);
+		const { definitions: matches } = await definitions({ search: definitionId, pageSize: 5, projectId });
+		const exact = matches.find((d) => String(d.definitionId ?? d.id ?? '') === definitionId);
+		if (exact === undefined) return null;
+		const meta = {
+			id: definitionId,
+			name: String(exact.name ?? ''),
+			capability: String(exact.capability ?? ''),
+			target: String(exact.target ?? ''),
+			group: String(exact.group ?? ''),
+			version: typeof exact.version === 'number' ? exact.version : null,
+		};
+		defMetaCache.set(definitionId, meta);
+		return meta;
+	}
+
+	/** 模型名缺失才查目录；命中后回填 definitionName + detail.definition（一次）。 */
+	async function ensureDefinitionMeta(run, needSession) {
+		const definitionId = String(run.definitionId || run.detail?.definition?.id || '');
+		if (definitionId === '' || String(run.definitionName ?? '') !== '' || run.projectId === '') return run;
+		let meta = null;
+		try {
+			await needSession();
+			meta = await definitionMetaOf(definitionId, run.projectId);
+		} catch (error) { log(`definitionMeta ${definitionId} failed: ${firstLine(error?.message)}`); }
+		if (meta === null || meta.name === '') return run;
+		const patch = { definitionName: meta.name };
+		if (String(run.detail?.definition?.capability ?? '') === '') {
+			patch.detail = { ...(run.detail ?? {}), definition: { ...(run.detail?.definition ?? {}), ...meta } };
+		}
+		await store.mutate((s) => store.patchRun(s, run.id, patch));
+		return snapshot(run.id);
+	}
+
 	async function runDetail(runId) {
 		return queued(async () => {
-			const run = snapshot(runId);
+			let run = snapshot(runId);
 			if (run === undefined) throw new store.StoreError(`run ${runId} 不存在`);
-			const out = { run, facts: null, inputs: [], outputs: [], intermediates: [] };
-			if (run.workflowRunId === '' || run.projectId === '') return out;
-			await ensureSession(run.projectId);
-			let facts = {};
-			try { facts = await getRunFacts(run.workflowRunId); } catch (error) {
-				out.factsError = firstLine(error?.message);
-				return out;
+			// 会话按需开：journal 里什么都有的时候，一次 az8 都不调
+			let sessionReady = false;
+			let sessionError = '';
+			const needSession = async () => {
+				if (sessionReady) return;
+				if (sessionError !== '') throw new Error(sessionError);
+				await ensureSession(run.projectId);
+				sessionReady = true;
+			};
+			const guard = async (fn) => {
+				try { await fn(); }
+				catch (error) { sessionError = sessionError || firstLine(error?.message); }
+			};
+			// 终态且已落盘 → 用 journal；否则活查
+			const terminal = JOURNAL_TERMINAL.has(run.status);
+			let facts = terminal && run.facts != null ? run.facts : null;
+			const patch = {};
+			// ① 权威事实
+			if (run.projectId !== '' && run.workflowRunId !== '' && facts === null) {
+				await guard(async () => {
+					await needSession();
+					facts = scrubFacts(await getRunFacts(run.workflowRunId));
+					if (terminal && typeof facts.status === 'string') patch.facts = facts;
+				});
 			}
-			out.facts = facts;
-			// 输入节点（prompt / config 的 viewNode 绑定，可能缺失）与输出节点（slotName 带 role）。
-			for (const hit of deepScan(facts, (v) => Array.isArray(v.inputs))) {
-				for (const item of hit.inputs) out.inputs.push(item);
+			// ② 老 run 回填：严格按 workflowRunId 匹配 history；最多试 3 次（节点被删时不无限重试）
+			if (sessionError === '' && run.projectId !== '' && run.viewNodeId !== '' && run.enriched !== true
+				&& (run.detail == null || Object.keys(run.timeline ?? {}).length === 0 || !Array.isArray(run.references))) {
+				const tries = (run.enrichTries ?? 0) + 1;
+				patch.enrichTries = tries;
+				if (tries >= 3) patch.enriched = true;
+				await guard(async () => {
+					await needSession();
+					const json = await callOk(['session', 'query', 'canvas.detail', '--view-node-id', run.viewNodeId], 'canvas.detail', 30_000);
+					const node = deepScan(json, (v) => v !== null && typeof v === 'object' && v.id === run.viewNodeId)[0];
+					if (node !== undefined) Object.assign(patch, backfillFromHistory(run, node, pickHistory(node, run)));
+					patch.enriched = true; // 节点已不在画布上也标记完成：没有可回填的东西
+				});
 			}
-			out.inputs = out.inputs.slice(0, 12);
-			for (const hit of deepScan(facts, (v) => Array.isArray(v.outputs))) {
-				for (const item of hit.outputs) {
-					out.outputs.push({
-						coreNodeId: String(item?.coreNodeId ?? ''),
-						slotName: String(item?.slotName ?? ''),
-						role: String(item?.role ?? ''),
-					});
+			if (Object.keys(patch).length > 0) {
+				await store.mutate((s) => store.patchRun(s, runId, patch));
+				run = snapshot(runId);
+			}
+			// ③ 模型名
+			if (sessionError === '') {
+				const named = await ensureDefinitionMeta(run, needSession).catch((error) => { sessionError = sessionError || firstLine(error?.message); return run; });
+				run = named;
+			}
+			// ④ 组装
+			const state = store.loadState();
+			const view = buildRunDetail(run, facts, state);
+			// ⑤ 预览：中间产物按 coreNodeId、引用按 viewNodeId 下到 cache（≤3/≤4，磁盘已有则复用）
+			if (sessionError === '' && run.projectId !== '') {
+				for (const item of view.intermediates.slice(0, 3)) {
+					let hit = null;
+					await guard(async () => { await needSession(); hit = await previewCanvasNode(run.projectId, { coreNodeId: item.coreNodeId }); });
+					if (hit !== null) { item.url = hit.url; item.kind = hit.kind; }
+				}
+				for (const input of view.inputs.slice(0, 4)) {
+					const assetId = state.runs.find((r) => r.id === input.upstreamRunId)?.assets?.[0];
+					if (assetId !== undefined) { input.assetId = assetId; continue; }
+					let hit = null;
+					await guard(async () => { await needSession(); hit = await previewCanvasNode(run.projectId, { viewNodeId: input.viewNodeId }); });
+					if (hit !== null) { input.url = hit.url; input.kind = hit.kind; }
 				}
 			}
-			out.outputs = out.outputs.slice(0, 12);
-			// 中间产物预览：生成目标附近画布上的媒体节点，排除最终产物（已在 assets）。
-			try {
-				const detail = await callOk(['session', 'query', 'canvas.detail', '--view-node-id', run.viewNodeId], 'canvas.detail', 30_000);
-				const state = store.loadState();
-				const finalIds = new Set((run.assets ?? []).map((id) => store.getAsset(state, id)?.coreNodeId).filter(Boolean));
-				const seen = new Set();
-				for (const node of deepScan(detail, (v) => typeof v === 'object' && (v.contentType === 'image' || v.contentType === 'video' || v.contentType === 'audio') && typeof v.id === 'string')) {
-					if (finalIds.has(node.id) || seen.has(node.id)) continue;
-					seen.add(node.id);
-					if (out.intermediates.length >= 6) break;
-					const url = await previewCanvasNode(run.projectId, node.id);
-					if (url !== null) out.intermediates.push({ viewNodeId: node.id, contentType: node.contentType, url });
-				}
-			} catch (error) {
-				log(`runDetail canvas scan failed: ${firstLine(error?.message)}`);
-			}
-			return out;
+			return { ok: true, ...view, ...(sessionError !== '' ? { factsError: sessionError } : {}) };
 		});
 	}
 
