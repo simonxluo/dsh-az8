@@ -81,6 +81,7 @@ dsh plugin --profile desktop add github:simonxluo/dsh-az8
 │                   ┌────▼─────┐                        ┌───────▼────────┐   │
 │                   │ store.js │                        │ studio.az8.art │   │
 │                   │ state.json│                       │  (云端画布)     │   │
+│                   └────┬─────┘                        └────────────────┘   │
 │  ┌─────────────┐  ┌────▼──────────┐   webServer 路由                       │
 │  │  client.js  │◀─│ panel.js      │  /_dsh/dsh-az8/{state,credits,         │
 │  │ 右侧三页签   │  │ 面板 API+媒体  │                   detail,cache,media} │
