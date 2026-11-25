@@ -73,6 +73,19 @@ function tryParseJson(text) {
 }
 
 /**
+ * 全局串行链：短命令（≤SERIALIZE_MAX_MS）排队执行，杜绝并发 az8 进程同时刷新
+ * refresh token 触发服务端"重用检测"吊销会话（2026-11 连续三次 reauthentication-required
+ * 的根因）。长等待（waitWorkflowRun 等 >2 分钟的观察窗）不占链，避免饿死面板轮询。
+ */
+const SERIALIZE_MAX_MS = 120_000;
+let serialChain = Promise.resolve();
+function serialize(fn) {
+	const next = serialChain.then(fn, fn);
+	serialChain = next.then(() => undefined, () => undefined);
+	return next;
+}
+
+/**
  * 运行一次 az8 命令。永不抛错——返回结构化结果，由调用方分类决策。
  * @returns {{exitCode:number, killed:boolean, classification:string, stdout:string, stderr:string, json?:any}}
  */
@@ -81,6 +94,11 @@ export function run(args, options = {}) {
 	const requested = options.cliBin;
 	const binName = typeof requested === 'string' && requested.trim() !== '' ? requested.trim() : DEFAULT_BIN;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const spawnOnce = () => rawRun(binName, args, options, timeoutMs);
+	return timeoutMs <= SERIALIZE_MAX_MS ? serialize(spawnOnce) : spawnOnce();
+}
+
+function rawRun(binName, args, options, timeoutMs) {
 	return new Promise((resolve) => {
 		let child;
 		let bin;

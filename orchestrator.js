@@ -640,12 +640,21 @@ export function createOrchestrator({ cliBin = 'az8', logger, jobs, runner } = {}
 		});
 	}
 
+	// whoami 结果进程内缓存 10 分钟：面板 credits 轮询不该反复 spawn CLI
+	//（并发/高频 az8 进程会触发 refresh token 重用检测，2026-11 三次吊销的教训）。
+	let whoamiCache = { at: 0, value: null };
+	async function whoamiCached() {
+		if (whoamiCache.value !== null && Date.now() - whoamiCache.at < 10 * 60_000) return whoamiCache.value;
+		const whoami = await callOk(['whoami'], 'whoami', 30_000);
+		whoamiCache = { at: Date.now(), value: whoami };
+		return whoami;
+	}
+
 	async function status() {
-		const [whoami, credits, projectsJson] = await Promise.all([
-			callOk(['whoami'], 'whoami', 30_000),
-			callOk(['credits'], 'credits', 30_000),
-			call(['projects', 'list', '--scope', 'owned'], 30_000),
-		]);
+		// 串行（不是 Promise.all）：多个 az8 进程并发刷新 token 会被服务端判重用吊销。
+		const whoami = await whoamiCached();
+		const credits = await callOk(['credits'], 'credits', 30_000);
+		const projectsJson = await call(['projects', 'list', '--scope', 'owned'], 30_000);
 		const projects = projectsJson.exitCode === 0 && Array.isArray(projectsJson.json?.projects) ? projectsJson.json.projects : [];
 		await store.mutate((s) => store.setProjectsCache(s, projects));
 		const current = await call(['session', 'current'], 15_000);

@@ -191,7 +191,8 @@ export function installPanelWeb(ctx, orch, creditsProvider) {
 				const verdict = loopVerdict(request);
 				if (verdict !== undefined) { sendJson(response, 403, { ok: false, error: verdict }); return; }
 				if (request.method !== 'GET') { response.writeHead(405, { allow: 'GET' }); response.end(); return; }
-				if (Date.now() - creditsCache.at > 60_000) {
+				// 5 分钟缓存：credits 轮询太勤会高频 spawn az8，触发 refresh token 重用检测。
+				if (Date.now() - creditsCache.at > 300_000) {
 					try {
 						const status = await creditsProvider();
 						creditsCache = { at: Date.now(), value: status };
